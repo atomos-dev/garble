@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -15,6 +16,35 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+func writeStringArrayToJSONByFilename(filename string, arr []string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fmt.Fprintln(f, "[")
+	for i, str := range arr {
+		if i > 0 {
+			fmt.Fprintln(f, ",")
+		}
+		fmt.Fprintf(f, "  %q", str)
+	}
+	fmt.Fprintln(f, "\n]")
+	return nil
+}
+
+func readStringArrayFromJSONByFilename(filename string) ([]string, error) {
+	arr := []string{}
+	f, err := os.Open(filename)
+	defer f.Close()
+	if err != nil {
+		return arr, err
+	}
+	dec := json.NewDecoder(f)
+	err = dec.Decode(&arr)
+	return arr, err
+}
 
 // commandReverse implements "garble reverse".
 func commandReverse(args []string) error {
@@ -148,6 +178,16 @@ One can reverse a captured panic stack trace as follows:
 				return true
 			})
 		}
+	}
+
+	if os.Getenv("GARBLE_WRITE_REPLACES") != "" {
+		writeStringArrayToJSONByFilename(os.Getenv("GARBLE_WRITE_REPLACES"), replaces)
+	}
+	if os.Getenv("GARBLE_READ_REPLACES") != "" {
+		replaces, err = readStringArrayFromJSONByFilename(os.Getenv("GARBLE_READ_REPLACES"))
+	}
+	if err != nil {
+		return err
 	}
 	repl := strings.NewReplacer(replaces...)
 
