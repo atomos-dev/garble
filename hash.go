@@ -20,24 +20,35 @@ import (
 
 const buildIDSeparator = "/"
 
-// splitActionID returns the action ID half of a build ID, the first component.
+// splitActionID returns the action ID half of a build ID, the first hash.
 func splitActionID(buildID string) string {
 	return buildID[:strings.Index(buildID, buildIDSeparator)]
 }
 
-// splitContentID returns the content ID half of a build ID, the last component.
+// splitContentID returns the content ID half of a build ID, the last hash.
 func splitContentID(buildID string) string {
 	return buildID[strings.LastIndex(buildID, buildIDSeparator)+1:]
 }
 
-// decodeHash is the opposite of hashToString, with a panic for error handling
-// since it should never happen.
-func decodeHash(str string) []byte {
+// buildIDHashLength is the number of bytes each build ID hash takes,
+// such as an action ID or a content ID.
+const buildIDHashLength = 15
+
+// decodeBuildIDHash decodes a build ID hash in base64, just like cmd/go does.
+func decodeBuildIDHash(str string) []byte {
 	h, err := base64.RawURLEncoding.DecodeString(str)
 	if err != nil {
 		panic(fmt.Sprintf("invalid hash %q: %v", str, err))
 	}
+	if len(h) != buildIDHashLength {
+		panic(fmt.Sprintf("decodeBuildIDHash expects to result in a hash of length %d, got %d", buildIDHashLength, len(h)))
+	}
 	return h
+}
+
+// encodeBuildIDHash encodes a build ID hash in base64, just like cmd/go does.
+func encodeBuildIDHash(h [sha256.Size]byte) string {
+	return base64.RawURLEncoding.EncodeToString(h[:buildIDHashLength])
 }
 
 func alterToolVersion(tool string, args []string) error {
@@ -57,7 +68,7 @@ func alterToolVersion(tool string, args []string) error {
 	var toolID []byte
 	if f[2] == "devel" {
 		// On the development branch, use the content ID part of the build ID.
-		toolID = decodeHash(splitContentID(f[len(f)-1]))
+		toolID = decodeBuildIDHash(splitContentID(f[len(f)-1]))
 	} else {
 		// For a release, the output is like: "compile version go1.9.1 X:framepointer".
 		// Use the whole line, as we can assume it's unique.
@@ -70,9 +81,9 @@ func alterToolVersion(tool string, args []string) error {
 	// the action (build) or not. Since cmd/go parses the last word in the
 	// output as "buildID=...", we simply add "+garble buildID=_/_/_/${hash}".
 	// The slashes let us imitate a full binary build ID, but we assume that
-	// the other components such as the action ID are not necessary, since the
+	// the other hashes such as the action ID are not necessary, since the
 	// only reader here is cmd/go and it only consumes the content ID.
-	fmt.Printf("%s +garble buildID=_/_/_/%s\n", line, hashToString(contentID))
+	fmt.Printf("%s +garble buildID=_/_/_/%s\n", line, encodeBuildIDHash(contentID))
 	return nil
 }
 
@@ -87,26 +98,27 @@ var (
 //
 // This includes garble's own version, obtained via its own binary's content ID,
 // as well as any other options which affect a build, such as GOGARBLE and -tiny.
-func addGarbleToHash(inputHash []byte) []byte {
+func addGarbleToHash(inputHash []byte) [sha256.Size]byte {
 	// Join the two content IDs together into a single base64-encoded sha256
 	// sum. This includes the original tool's content ID, and garble's own
 	// content ID.
 	hasher.Reset()
 	hasher.Write(inputHash)
-	if len(cache.BinaryContentID) == 0 {
+	if len(sharedCache.BinaryContentID) == 0 {
 		panic("missing binary content ID")
 	}
-	hasher.Write(cache.BinaryContentID)
+	hasher.Write(sharedCache.BinaryContentID)
 
 	// We also need to add the selected options to the full version string,
 	// because all of them result in different output. We use spaces to
 	// separate the env vars and flags, to reduce the chances of collisions.
-	fmt.Fprintf(hasher, " GOGARBLE=%s", cache.GOGARBLE)
+	fmt.Fprintf(hasher, " GOGARBLE=%s", sharedCache.GOGARBLE)
 	appendFlags(hasher, true)
 	// addGarbleToHash returns the sum buffer, so we need a new copy.
 	// Otherwise the next use of the global sumBuffer would conflict.
-	sumBuffer := make([]byte, 0, sha256.Size)
-	return hasher.Sum(sumBuffer)[:buildIDComponentLength]
+	var sumBuffer [sha256.Size]byte
+	hasher.Sum(sumBuffer[:0])
+	return sumBuffer
 }
 
 // appendFlags writes garble's own flags to w in string form.
@@ -146,19 +158,12 @@ func appendFlags(w io.Writer, forBuildHash bool) {
 		io.WriteString(w, " -seed=")
 		io.WriteString(w, flagSeed.String())
 	}
+	if flagControlFlow && forBuildHash {
+		io.WriteString(w, " -ctrlflow")
+	}
 	if literals.TestObfuscator != "" && forBuildHash {
 		io.WriteString(w, literals.TestObfuscator)
 	}
-}
-
-// buildIDComponentLength is the number of bytes each build ID component takes,
-// such as an action ID or a content ID.
-const buildIDComponentLength = 15
-
-// hashToString encodes the first 120 bits of a sha256 sum in base64, the same
-// format used for components in a build ID.
-func hashToString(h []byte) string {
-	return base64.RawURLEncoding.EncodeToString(h[:buildIDComponentLength])
 }
 
 func buildidOf(path string) (string, error) {
@@ -176,12 +181,11 @@ func buildidOf(path string) (string, error) {
 var (
 	// Hashed names are base64-encoded.
 	// Go names can only be letters, numbers, and underscores.
-	// This means we can use base64's URL encoding, minus '-'.
-	// Use the URL encoding, replacing '-' with a duplicate 'z'.
+	// This means we can use base64's URL encoding, minus '-',
+	// which is later replaced with a duplicate 'a'.
 	// Such a lossy encoding is fine, since we never decode hashes.
 	// We don't need padding either, as we take a short prefix anyway.
-	nameCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_z"
-	nameBase64  = base64.NewEncoding(nameCharset).WithPadding(base64.NoPadding)
+	nameBase64 = base64.URLEncoding.WithPadding(base64.NoPadding)
 
 	b64NameBuffer [12]byte // nameBase64.EncodedLen(neededSumBytes) = 12
 )
@@ -198,7 +202,7 @@ func toUpper(b byte) byte { return b - ('a' - 'A') }
 func runtimeHashWithCustomSalt(salt []byte) uint32 {
 	hasher.Reset()
 	if !flagSeed.present() {
-		hasher.Write(cache.ListedPackages["runtime"].GarbleActionID)
+		hasher.Write(sharedCache.ListedPackages["runtime"].GarbleActionID[:])
 	} else {
 		hasher.Write(flagSeed.bytes)
 	}
@@ -220,8 +224,11 @@ func entryOffKey() uint32 {
 }
 
 func hashWithPackage(pkg *listedPackage, name string) string {
+	// If the user provided us with an obfuscation seed,
+	// we use that with the package import path directly..
+	// Otherwise, we use GarbleActionID as a fallback salt.
 	if !flagSeed.present() {
-		return hashWithCustomSalt(pkg.GarbleActionID, name)
+		return hashWithCustomSalt(pkg.GarbleActionID[:], name)
 	}
 	// Use a separator at the end of ImportPath as a salt,
 	// to ensure that "pkgfoo.bar" and "pkg.foobar" don't both hash
@@ -229,15 +236,72 @@ func hashWithPackage(pkg *listedPackage, name string) string {
 	return hashWithCustomSalt([]byte(pkg.ImportPath+"|"), name)
 }
 
-func hashWithStruct(strct *types.Struct, fieldName string) string {
-	// TODO: We should probably strip field tags here.
-	// Do we need to do anything else to make a
-	// struct type "canonical"?
-	fieldsSalt := []byte(strct.String())
-	if !flagSeed.present() {
-		fieldsSalt = addGarbleToHash(fieldsSalt)
+// stripStructTags takes the bytes produced by [types.WriteType]
+// and removes any struct tags in-place, such as rewriting
+//
+//	struct{Foo int; Bar string "json:\"bar\""}
+//
+// into
+//
+//	struct{Foo int; Bar string}
+//
+// Note that, unlike most Go source, WriteType uses double quotes for tags.
+//
+// Reusing WriteType does require a second pass over its output here,
+// which we could save by implementing our own modified version of WriteType.
+// However, that would be a significant amount of code to maintain.
+func stripStructTags(p []byte) []byte {
+	i := 0
+	for i < len(p) {
+		b := p[i]
+		start := i - 1 // a struct tag is preceded by a space
+		i++
+		if b != '"' {
+			continue
+		}
+		// Find the closing double quote, skipping over escaped characters.
+		// Note that we should probably iterate over runes and not bytes,
+		// but this byte implementation is probably good enough in practice.
+		for {
+			b = p[i]
+			i++
+			if b == '\\' {
+				i++
+			} else if b == '"' {
+				break
+			}
+		}
+		end := i
+		// Remove the bytes between start and end,
+		// and reset i to start, since we just shortened p.
+		p = append(p[:start], p[end:]...)
+		i = start
 	}
-	return hashWithCustomSalt(fieldsSalt, fieldName)
+	return p
+}
+
+var typeIdentityBuf bytes.Buffer
+
+// hashWithStruct is separate from hashWithPackage since Go
+// allows converting between struct types across packages.
+// Hashing struct field names differently between packages would break that.
+//
+// We hash field names with the identity struct type as a salt
+// so that the same field name used in different struct types is obfuscated differently.
+// Note that "identity" means omitting struct tags since conversions ignore them.
+func hashWithStruct(strct *types.Struct, field *types.Var) string {
+	typeIdentityBuf.Reset()
+	types.WriteType(&typeIdentityBuf, strct, nil)
+	salt := stripStructTags(typeIdentityBuf.Bytes())
+
+	// If the user provided us with an obfuscation seed,
+	// we only use the identity struct type as a salt.
+	// Otherwise, we add garble's own inputs to the salt as a fallback.
+	if !flagSeed.present() {
+		withGarbleHash := addGarbleToHash(salt)
+		salt = withGarbleHash[:]
+	}
+	return hashWithCustomSalt(salt, field.Name())
 }
 
 // minHashLength and maxHashLength define the range for the number of base64
@@ -316,30 +380,35 @@ func hashWithCustomSalt(salt []byte, name string) string {
 	nameBase64.Encode(b64NameBuffer[:], sum[:neededSumBytes])
 	b64Name := b64NameBuffer[:hashLength]
 
-	// Even if we are hashing a package path, we still want the result to be
-	// a valid identifier, since we'll use it as the package name too.
+	// Even if we are hashing a package path, which is not an identifier,
+	// we still want the result to be a valid identifier,
+	// since we'll use it as the package name too.
 	if isDigit(b64Name[0]) {
 		// Turn "3foo" into "Dfoo".
 		// Similar to toLower, since uppercase letters go after digits
 		// in the ASCII table.
 		b64Name[0] += 'A' - '0'
 	}
-	// Keep the result equally exported or not, if it was an identifier.
-	if !token.IsIdentifier(name) {
-		return string(b64Name)
-	}
-	if token.IsExported(name) {
-		if b64Name[0] == '_' {
-			// Turn "_foo" into "Zfoo".
-			b64Name[0] = 'Z'
-		} else if isLower(b64Name[0]) {
-			// Turn "afoo" into "Afoo".
-			b64Name[0] = toUpper(b64Name[0])
+	for i, b := range b64Name {
+		if b == '-' { // URL encoding uses dashes, which aren't valid
+			b64Name[i] = 'a'
 		}
-	} else {
-		if isUpper(b64Name[0]) {
-			// Turn "Afoo" into "afoo".
-			b64Name[0] = toLower(b64Name[0])
+	}
+	// Valid identifiers should stay exported or unexported.
+	if token.IsIdentifier(name) {
+		if token.IsExported(name) {
+			if b64Name[0] == '_' {
+				// Turn "_foo" into "Zfoo".
+				b64Name[0] = 'Z'
+			} else if isLower(b64Name[0]) {
+				// Turn "afoo" into "Afoo".
+				b64Name[0] = toUpper(b64Name[0])
+			}
+		} else {
+			if isUpper(b64Name[0]) {
+				// Turn "Afoo" into "afoo".
+				b64Name[0] = toLower(b64Name[0])
+			}
 		}
 	}
 	return string(b64Name)

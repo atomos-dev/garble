@@ -236,7 +236,7 @@ func stripRuntime(basename string, file *ast.File) {
 				"printAncestorTracebackFuncInfo", "goroutineheader", "tracebackothers", "tracebackHexdump", "printCgoTraceback":
 				funcDecl.Body.List = nil
 			case "printOneCgoTraceback":
-				funcDecl.Body = ah.BlockStmt(ah.ReturnStmt(ah.IntLit(0)))
+				funcDecl.Body = ah.BlockStmt(ah.ReturnStmt(ast.NewIdent("false")))
 			default:
 				if strings.HasPrefix(funcDecl.Name.Name, "print") {
 					funcDecl.Body.List = nil

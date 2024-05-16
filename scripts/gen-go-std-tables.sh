@@ -12,7 +12,7 @@ runtime_and_deps=$(go list -deps runtime)
 # This resulting list is what we need to "go list" when obfuscating the runtime,
 # as they are the packages that we may be missing.
 runtime_linknamed=$(comm -23 <(
-	sed -rn 's@//go:linkname .* ([^.]*)\.[^.]*@\1@p' "${goroot}"/src/runtime/*.go | grep -vE '^main|^runtime\.' | sort -u
+	sed -rn 's@//go:linkname .* ([^.]*)\.[^.]*@\1@p' "${goroot}"/src/runtime/*.go | grep -vE '^main|^runtime\.|_test$' | sort -u
 ) <(
 	# Note that we assume this is constant across platforms.
 	go list -deps runtime | sort -u
@@ -40,6 +40,9 @@ var runtimeLinknamed = []string{
 $(for path in ${runtime_linknamed}; do
 	echo "\"${path}\"",
 done)
+	// The net package linknames to the runtime, not the other way around.
+	// TODO: support this automatically via our script.
+	"net",
 }
 
 var compilerIntrinsicsPkgs = map[string]bool{
@@ -52,5 +55,9 @@ var compilerIntrinsicsFuncs = map[string]bool{
 $(while read path name; do
 	echo "\"${path}.${name}\": true,"
 done <<<"${compiler_intrinsics_table}")
+}
+
+var reflectSkipPkg = map[string]bool{
+	"fmt": true,
 }
 EOF

@@ -1,6 +1,6 @@
 [!cgo] skip 'this test requires cgo to be enabled'
 
-garble build
+exec garble build
 ! stderr 'warning' # check that the C toolchain is happy
 exec ./main
 cmp stdout main.stdout
@@ -13,11 +13,11 @@ env GARBLE_TEST_REVERSING=true
 exec ./main
 cp stdout reversing.stdout
 stdin reversing.stdout
-garble reverse .
+exec garble reverse .
 cmp stdout reversed.stdout
 env GARBLE_TEST_REVERSING=false
 
-garble -tiny build
+exec garble -tiny build
 exec ./main
 cmp stdout main.stdout
 
@@ -29,7 +29,7 @@ binsubstr main$exe 'privateAdd'
 -- go.mod --
 module test/main
 
-go 1.20
+go 1.22
 -- main.go --
 package main
 
@@ -63,7 +63,7 @@ import (
 )
 
 /*
-#include "separate.h"
+#include "separate.h" // inline comment
 
 static int privateAdd(int a, int b) {
 	return a + b;

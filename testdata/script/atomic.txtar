@@ -6,7 +6,7 @@
 [amd64] [!darwin] env GOARCH=386
 [arm64] [!darwin] env GOARCH=arm
 
-garble build
+exec garble build
 exec ./main
 cmp stderr main.stderr
 
@@ -18,7 +18,7 @@ cmp stderr main.stderr
 -- go.mod --
 module test/main
 
-go 1.20
+go 1.22
 -- main.go --
 package main
 

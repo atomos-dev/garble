@@ -1,9 +1,9 @@
-garble build
+exec garble build
 ! binsubstr main$exe ${WORK} 'garble_main.go' 'GenericFunc' 'GenericVector' 'PredeclaredSignedInteger' 'StringableSignedInteger' 'CombineEmbeds' 'GenericParam'
 -- go.mod --
 module test/main
 
-go 1.20
+go 1.22
 -- garble_main.go --
 package main
 

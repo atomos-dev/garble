@@ -1,8 +1,8 @@
-garble build
+exec garble build
 exec ./main
 cmp stdout main.stdout
 
-! binsubstr main$exe 'garble_main.go' 'test/main' 'importedpkg.' 'DownstreamObfuscated' 'SiblingObfuscated' 'IndirectObfuscated' 'IndirectNamedWithoutReflect' 'AliasIndirectNamedWithReflect' 'AliasIndirectNamedWithoutReflect' 'FmtTypeField'
+! binsubstr main$exe 'garble_main.go' 'test/main' 'importedpkg.' 'DownstreamObfuscated' 'SiblingObfuscated' 'IndirectObfuscated' 'IndirectNamedWithoutReflect' 'AliasIndirectNamedWithReflect' 'AliasIndirectNamedWithoutReflect' 'FmtTypeField' 'LocalObfuscated'
 binsubstr main$exe 'ReflectInDefined' 'ExportedField2' 'unexportedField2' 'IndirectUnobfuscated' 'IndirectNamedWithReflect'
 
 [short] stop # no need to verify this with -short
@@ -14,16 +14,25 @@ cmp stdout main.stdout
 -- go.mod --
 module test/main
 
-go 1.20
+go 1.22
 -- garble_main.go --
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"reflect"
+	"unsafe"
 	"strings"
+	"sync"
 	"text/template"
 
 	"test/main/importedpkg"
@@ -107,6 +116,62 @@ func main() {
 	variadic := VariadicReflection{ReflectionField: "variadic"}
 	_ = importedpkg.VariadicReflect("foo", 1, variadic, false)
 	printfWithoutPackage("%#v\n", variadic)
+
+	testx509()
+	testGoSpew()
+
+	// Very complex reflection used by gorm
+	user := StatUser{}
+	find(&user)
+
+	// Similar to gorm with composite literals instead of direct assignments
+	userComp := StatCompUser{}
+	findComp(&userComp)
+
+	x := UnnamedStructInterface(importedpkg.ReflectUnnamedStruct(0))
+	x.UnnamedStructMethod(struct{ UnnamedStructField string }{UnnamedStructField: "field value"})
+
+	// Local names not used in reflection should not be in the final binary,
+	// even if they are embedded in a struct and become a field name.
+	type unexportedLocalObfuscated struct { LocalObfuscatedA int }
+	type ExportedLocalObfuscated struct { LocalObfuscatedB int }
+	type EmbeddingObfuscated struct {
+		unexportedLocalObfuscated
+		ExportedLocalObfuscated
+	}
+	// Ensure the types are kept in the binary. Use an anonymous type too.
+	_ = fmt.Sprintf("%#v", EmbeddingObfuscated{})
+	_ = fmt.Sprintf("%#v", struct{ExportedLocalObfuscated}{})
+
+	// reflection can see all type names, even local ones, so they cannot be obfuscated.
+	{
+		type TypeOfNamedField struct    { NamedReflectionField int }
+		type TypeOfEmbeddedField struct { EmbeddedReflectionField int }
+		type TypeOfParent struct {
+			ReflectionField TypeOfNamedField
+			TypeOfEmbeddedField
+		}
+		t := reflect.TypeOf(TypeOfParent{})
+		fmt.Println("TypeOfParent's own name:", t.Name())
+		namedField, _ := t.FieldByName("ReflectionField")
+		namedFieldField, _ := namedField.Type.FieldByName("NamedReflectionField")
+		fmt.Println("TypeOfParent named:",
+			namedField.Type.Name(),
+			namedFieldField.Name,
+		)
+		embedField, _ := t.FieldByName("TypeOfEmbeddedField")
+		embedFieldField, _ := embedField.Type.FieldByName("EmbeddedReflectionField")
+		fmt.Println("TypeOfParent embedded:",
+			embedField.Type.Name(),
+			embedFieldField.Name,
+		)
+	}
+
+	y := UnnamedStructFields{}
+	y.unexportedGoGoProto = new(struct {
+		mu           sync.Mutex
+		extensionMap map[int32]EncodingT
+	})
 }
 
 type EmbeddingIndirect struct {
@@ -155,19 +220,254 @@ type FmtType struct {
 }
 
 // copied from github.com/davecgh/go-spew, which reaches into reflect's internals
-var _ = func() uintptr {
-	field, ok := reflect.TypeOf(reflect.Value{}).FieldByName("flag")
-	if !ok {
-		panic("reflect.Value has no flag field")
-	}
-	return field.Offset
-}()
+func testGoSpew() {
+	flagValOffset := func() uintptr {
+		field, ok := reflect.TypeOf(reflect.Value{}).FieldByName("flag")
+		if !ok {
+			panic("reflect.Value has no flag field")
+		}
+		return field.Offset
+	}()
 
+	type flag uintptr
+	flagField := func(v *reflect.Value) *flag {
+		return (*flag)(unsafe.Pointer(uintptr(unsafe.Pointer(v)) + flagValOffset))
+	}
+
+	type t0 int
+	var t struct {
+		A t0
+		t0
+		a t0
+	}
+	vA := reflect.ValueOf(t).FieldByName("A")
+	va := reflect.ValueOf(t).FieldByName("a")
+	vt0 := reflect.ValueOf(t).FieldByName("t0")
+	flagvA := *flagField(&vA)
+	flagva := *flagField(&va)
+	flagvt0 := *flagField(&vt0)
+
+	if flagvA&flagva&flagvt0 == 0 {
+		panic("reflect.Value read-only flag has changed semantics")
+	}
+
+	type T0 int
+	var T struct {
+		A T0
+		T0
+		a T0
+	}
+	vA = reflect.ValueOf(T).FieldByName("A")
+	va = reflect.ValueOf(T).FieldByName("a")
+	vt0 = reflect.ValueOf(T).FieldByName("T0")
+	flagvA = *flagField(&vA)
+	flagva = *flagField(&va)
+	flagvt0 = *flagField(&vt0)
+
+	if flagvA&flagva&flagvt0 == 0 {
+		panic("reflect.Value read-only flag has changed semantics")
+	}
+}
+
+// encoding/x509 uses encoding/asn1, which uses reflect.
+// In one place it depends on field names; that used to be broken by garble.
+func testx509() {
+	priv, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{Organization: []string{"Acme Co"}},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = x509.ParseCertificate(derBytes)
+	if err != nil {
+		panic(err)
+	}
+}
+
+type pingMsg struct {
+	Data string `sshtype:"192"`
+}
+
+type pongMsg struct {
+	Data string `sshtype:"193"`
+}
+
+// golang.org/x/crypto/ssh converts a reflected type to another type
+func testSSH() {
+	var msg = pingMsg{
+		Data: "data",
+	}
+	json.Marshal(msg)
+
+	_ = pongMsg(msg)
+}
+
+// variations similar to ssh
+type reflectedMsg struct {
+	Data string
+}
+
+type convertedMsg struct {
+	Data string
+}
+
+func reflectConvert() {
+	msg := reflectedMsg(convertedMsg{})
+	json.Marshal(msg)
+}
+
+type reflectedMsg2 struct {
+	Data string
+}
+
+type convertedMsg2 struct {
+	Data string
+}
+
+func unrelatedConvert() {
+	// only discoverable by rechecking the package
+	_ = convertedMsg2(reflectedMsg2{})
+}
+
+func reflectUnrelatedConv() {
+	var msg = reflectedMsg2{
+		Data: "data",
+	}
+	json.Marshal(msg)
+
+}
+
+
+type StatUser struct {
+	Id      int64 `gorm:"primaryKey"`
+	User_Id int64
+}
+
+type StatCompUser struct {
+	Id      int64 `gorm:"primaryKey"`
+	User_Id int64
+}
+
+type Transaction struct {
+	Statement Statement
+}
+
+type Statement struct {
+	Dest  interface{}
+	Model string
+}
+
+func find(dest interface{}) {
+	tx := Transaction{}
+
+	tx.Statement.Dest = dest
+	execute(tx)
+}
+
+func findComp(dest interface{}) {
+	tx := Transaction{
+		Statement: Statement{
+			Dest: dest,
+		},
+	}
+
+	execute(tx)
+}
+
+func execute(db Transaction) {
+	stmt := db.Statement
+
+	v := reflect.TypeOf(stmt.Dest)
+
+	fmt.Println(v)
+}
+
+type UnnamedStructInterface interface {
+	UnnamedStructMethod(struct{ UnnamedStructField string })
+}
+
+// Some projects declare types with unnamed struct fields,
+// and the entire type is used via reflection and cannot be obfuscated.
+// However, when assigning to these fields, the use of inline anonymous struct types
+// confused garble, and it did not obfuscate those inline structs as well.
+// That resulted in "cannot use X as Y value in assignment" build errors.
+
+var _ = reflect.TypeOf(UnnamedStructFields{})
+
+type UnnamedStructFields struct {
+	// As seen in github.com/gogo/protobuf/proto.
+	unexportedGoGoProto *struct {
+		mu           sync.Mutex
+		extensionMap map[int32]EncodingT
+	}
+}
+
+func gobStruct() {
+	type gobAlias struct {
+		Security []map[string]struct {
+			List []string
+			Pad  bool
+		}
+	}
+	alias := gobAlias{}
+
+	gob.NewEncoder(os.Stdout).Encode(alias)
+
+	alias.Security = make([]map[string]struct {
+		List []string
+		Pad  bool
+	}, 0, len([]string{}))
+}
+
+func gobMap() {
+	type gobAlias struct {
+		Security map[string]struct {
+			List []string
+			Pad  bool
+		}
+	}
+	alias := gobAlias{}
+
+	gob.NewEncoder(os.Stdout).Encode(alias)
+
+	alias.Security = make(map[string]struct {
+		List []string
+		Pad  bool
+	}, len([]string{}))
+}
+
+func gobChan() {
+	type gobAlias struct {
+		Security chan struct {
+			List []string
+			Pad  bool
+		}
+	}
+
+	alias := gobAlias{}
+
+	gob.NewEncoder(os.Stdout).Encode(alias)
+
+	alias.Security = make(chan struct {
+		List []string
+		Pad  bool
+	}, len([]string{}))
+}
 
 -- importedpkg/imported.go --
 package importedpkg
 
 import (
+	"fmt"
 	"reflect"
 
 	"test/main/importedpkg/indirect"
@@ -240,14 +540,18 @@ type ReflectEmbeddingNamed struct{}
 
 func VariadicReflect(x any, ys ...any) int {
 	_ = reflect.TypeOf(x)
-	_ = reflect.TypeOf(ys)
 
-	// TODO: we likely do not notice indirect calls via a range like this.
 	for _, y := range ys {
 		_ = reflect.TypeOf(y)
 	}
 
 	return len(ys)
+}
+
+type ReflectUnnamedStruct int
+
+func (ReflectUnnamedStruct) UnnamedStructMethod(s struct{ UnnamedStructField string }) {
+	fmt.Println(reflect.TypeOf(s))
 }
 
 -- importedpkg2/imported2.go --
@@ -293,3 +597,9 @@ IndirectNamedWithReflect{IndirectUnobfuscated:"indirect-with", DuplicateFieldNam
 ReflectionField
 {0}
 VariadicReflection{ReflectionField:"variadic"}
+*main.StatUser
+*main.StatCompUser
+struct { UnnamedStructField string }
+TypeOfParent's own name: TypeOfParent
+TypeOfParent named: TypeOfNamedField NamedReflectionField
+TypeOfParent embedded: TypeOfEmbeddedField EmbeddedReflectionField

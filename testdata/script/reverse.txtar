@@ -1,8 +1,8 @@
 # Unknown build flags should result in errors.
-! garble reverse -badflag=foo .
+! exec garble reverse -badflag=foo .
 stderr 'flag provided but not defined'
 
-garble build
+exec garble build
 exec ./main
 cp stderr main.stderr
 
@@ -16,19 +16,12 @@ grep 'goroutine 1 \[running\]' main.stderr
 ! grep 'ExportedLib(Type|Field)|unexportedMainFunc|test/main|long_main\.go|long_lib\.go' main.stderr
 
 stdin main.stderr
-garble reverse .
+exec garble reverse .
 cmp stdout reverse.stdout
 
 # Ensure that we cleaned up the temporary files.
 # Note that we rely on the unix-like TMPDIR env var name.
 [!windows] ! grepfiles ${TMPDIR} 'garble|importcfg|cache\.gob|\.go'
-
-! garble build ./build-error
-cp stderr build-error.stderr
-
-stdin build-error.stderr
-garble reverse ./build-error
-cmp stdout build-error-reverse.stdout
 
 [short] stop # no need to verify this with -short
 
@@ -38,22 +31,22 @@ exec ./main
 cmp stderr reverse.stdout
 
 # Ensure that we can still reverse with -literals.
-garble -literals build
+exec garble -literals build
 exec ./main
 cp stderr main-literals.stderr
 
 stdin main-literals.stderr
-garble -literals reverse .
+exec garble -literals reverse .
 cmp stdout reverse.stdout
 
 # Reversing a -literals output without the flag should fail.
 stdin main-literals.stderr
-! garble reverse .
+! exec garble reverse .
 cmp stdout main-literals.stderr
 -- go.mod --
 module test/main
 
-go 1.20
+go 1.22
 -- long_main.go --
 package main
 
@@ -109,7 +102,7 @@ func printStackTrace(w io.Writer) error {
 	// The format also changes depending on the ABI.
 	// Strip them out here, to have portable static stdout files.
 	rxCallArgs := regexp.MustCompile(`\(({|0x)[^)]+\)|\(\)`)
-	rxPointer := regexp.MustCompile(`\+0x[0-9a-f]+`)
+	rxPointer := regexp.MustCompile(`\+0x[[:xdigit:]]+`)
 
 	// Keep this comment here, because comments affect line numbers.
 
@@ -119,25 +112,6 @@ func printStackTrace(w io.Writer) error {
 	_, err := w.Write(stack)
 	return err
 }
--- build-error/error.go --
-package p
-
-import "reflect"
-
-// This program is especially crafted to work with "go build",
-// but fail with "garble build".
-// This is because we attempt to convert from two different struct types,
-// since only the anonymous one has its field name obfuscated.
-// This is useful, because we test that build errors can be reversed,
-// and it also includes a field name.
-
-type UnobfuscatedStruct struct {
-	SomeField int
-}
-
-var _ = reflect.TypeOf(UnobfuscatedStruct{})
-
-var _ = struct{SomeField int}(UnobfuscatedStruct{})
 -- reverse.stdout --
 lib filename: test/main/lib/long_lib.go
 
@@ -156,8 +130,3 @@ main.main(...)
 	test/main/long_main.go:11 +0x??
 
 main filename: test/main/long_main.go
--- build-error-reverse.stdout --
-# test/main/build-error
-test/main/build-error/error.go:18: cannot convert UnobfuscatedStruct{} (value of type UnobfuscatedStruct) to type struct{SomeField int}
-exit status 2
-exit status 1

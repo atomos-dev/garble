@@ -7,8 +7,11 @@ Obfuscate Go code by wrapping the Go toolchain. Requires Go 1.20 or later.
 	garble build [build flags] [packages]
 
 The tool also supports `garble test` to run tests with obfuscated code,
+`garble run` to obfuscate and execute simple programs,
 and `garble reverse` to de-obfuscate text such as stack traces.
-See `garble -h` for up to date usage information.
+Run `garble -h` to see all available commands and flags.
+
+You can also use `go install mvdan.cc/garble@master` to install the latest development version.
 
 ### Purpose
 
@@ -50,6 +53,29 @@ $ go1.17.1 download
 $ PATH=$(go1.17.1 env GOROOT)/bin:${PATH} garble build
 ```
 
+### Use cases
+
+A common question is why a code obfuscator is needed for Go, a compiled language.
+Go binaries include a surprising amount of information about the original source;
+even with debug information and symbol tables stripped, many names and positions
+remain in place for the sake of traces, reflection, and debugging.
+
+Some use cases for Go require sharing a Go binary with the end user.
+If the source code for the binary is private or requires a purchase,
+its obfuscation can help discourage reverse engineering.
+
+A similar use case is a Go library whose source is private or purchased.
+Since Go libraries cannot be imported in binary form, and Go plugins
+[have their shortcomings](https://github.com/golang/go/issues/19282),
+sharing obfuscated source code becomes an option.
+See [#369](https://github.com/burrowers/garble/issues/369).
+
+Obfuscation can also help with aspects entirely unrelated to licensing.
+For example, the `-tiny` flag can make binaries 15% smaller,
+similar to the [common practice in Android](https://developer.android.com/build/shrink-code#obfuscate) to reduce app sizes.
+Obfuscation has also helped some open source developers work around
+anti-virus scans incorrectly treating Go binaries as malware.
+
 ### Literal obfuscation
 
 Using the `-literals` flag causes literal expressions such as strings to be
@@ -78,6 +104,10 @@ exit the entire program without printing a stack trace, and source code
 positions and many names are removed.
 Similarly, `garble reverse` is generally not useful in this mode.
 
+### Control flow obfuscation
+
+See: [CONTROLFLOW.md](docs/CONTROLFLOW.md)
+
 ### Speed
 
 `garble build` should take about twice as long as `go build`, as it needs to
@@ -91,6 +121,10 @@ at a time. This allows Garble to fully support Go's build cache; incremental
 Note that the first call to `garble build` may be comparatively slow,
 as it has to obfuscate each package for the first time. This is akin to clearing
 `GOCACHE` with `go clean -cache` and running a `go build` from scratch.
+
+Garble also makes use of its own cache to reuse work, akin to Go's `GOCACHE`.
+It defaults to a directory under your user's cache directory,
+such as `~/.cache/garble`, and can be placed elsewhere by setting `GARBLE_CACHE`.
 
 ### Determinism and seeds
 
@@ -123,11 +157,11 @@ to document the current shortcomings of this tool.
   be required by interfaces. This area is a work in progress; see
   [#3](https://github.com/burrowers/garble/issues/3).
 
-* Garble aims to automatically detect which Go types are used with reflection,
-  as obfuscating those types might break your program.
+* Garble automatically detects which Go types are used with reflection
+  to avoid obfuscating them, as that might break your program.
   Note that Garble obfuscates [one package at a time](#speed),
   so if your reflection code inspects a type from an imported package,
-  and your program broke, you may need to add a "hint" in the imported package:
+  you may need to add a "hint" in the imported package to exclude obfuscating it:
    ```go
    type Message struct {
        Command string
@@ -138,8 +172,20 @@ to document the current shortcomings of this tool.
    var _ = reflect.TypeOf(Message{})
    ```
 
+* Aside from `GOGARBLE` to select patterns of packages to obfuscate,
+  and the hint above with `reflect.TypeOf` to exclude obfuscating particular types,
+  there is no supported way to exclude obfuscating a selection of files or packages.
+  More often than not, a user would want to do this to work around a bug; please file the bug instead.
+
+* Go programs [are initialized](https://go.dev/ref/spec#Program_initialization) one package at a time,
+  where imported packages are always initialized before their importers,
+  and otherwise they are initialized in the lexical order of their import paths.
+  Since garble obfuscates import paths, this lexical order may change arbitrarily.
+
 * Go plugins are not currently supported; see [#87](https://github.com/burrowers/garble/issues/87).
-* Garble requires `git` to patch the linker. That can be avoided once go-gitdiff supports [non-strict patches](https://github.com/bluekeyes/go-gitdiff/issues/30). 
+
+* Garble requires `git` to patch the linker. That can be avoided once go-gitdiff
+  supports [non-strict patches](https://github.com/bluekeyes/go-gitdiff/issues/30).
 
 ### Contributing
 

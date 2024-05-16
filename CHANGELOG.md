@@ -1,5 +1,87 @@
 # Changelog
 
+## [v0.12.1] - 2024-02-18
+
+This bugfix release fixes a regression in v0.12.0 that broke `x/sys/unix`.
+See #830.
+
+## [v0.12.0] - 2024-02-10
+
+This release continues support for Go 1.21 and includes fixes for Go 1.22,
+now that the final 1.22.0 release is out.
+
+@lu4p improved the detection of types used with reflection to track `make` calls too,
+fixing more `cannot use T1 as T2` errors when obfuscating types. See [#690].
+
+@pagran added a trash block generator to the control flow obfuscator.
+See [#825].
+
+A number of bugfixes are also included:
+* Avoid an error when building for `GOOS=ios` - [#816]
+* Prevent the shuffle literal obfuscation from being optimized away - [#819]
+* Support inline comments in assembly `#include` lines - [#812]
+
+## [v0.11.0] - 2023-12-02
+
+This release drops support for Go 1.20, continues support for Go 1.21,
+and adds initial support for the upcoming Go 1.22.
+
+@lu4p and @mvdan improved the code using SSA to detect which types are used with reflection,
+which should fix a number of errors such as `cannot use T1 as T2` or `cannot convert T1 to T2`.
+See: [#685], [#763], [#782], [#785], [#807].
+
+@pagran added experimental support for control flow obfuscation,
+which should provide stronger obfuscation of function bodies when enabled.
+See the documentation at [docs/CONTROLFLOW.md](https://github.com/burrowers/garble/blob/master/docs/CONTROLFLOW.md).
+See [#462].
+
+A number of bugfixes are also included:
+
+* Avoid panicking on a struct embedding a builtin alias - [#798]
+* Strip struct field tags when hashing struct types for type identity - [#801]
+
+## [v0.10.1] - 2023-06-25
+
+This bugfix release continues support for Go 1.20 and the upcoming 1.21,
+and features:
+
+* Avoid obfuscating local types used for reflection, like in `go-spew` - #765
+
+## [v0.10.0] - 2023-06-05
+
+This release drops support for Go 1.19, continues support for Go 1.20,
+and adds initial support for the upcoming Go 1.21.
+
+@lu4p rewrote the code to detect whether `reflect` is used on each Go type,
+which is used to decide which Go types should not be obfuscated to prevent breakage.
+The old code analyzed syntax trees with type information, which is cheap but clumsy.
+The new code uses SSA, which adds a bit of CPU cost to builds, but allows for a
+more powerful analysis that is less likely to break on edge cases.
+While this change does slow down builds slightly, we will start using SSA for more
+features in the near term, such as control flow obfuscation. See [#732].
+
+@pagran improved the patching of Go's linker to also obfuscate funcInfo.entryoff,
+making it harder to relate a function's metadata with its body in the binary. See [#641].
+
+@mvdan rewrote garble's caching to be more robust, avoiding errors such as
+"cannot load garble export file". The new caching system is entirely separate
+from Go's `GOCACHE`, being placed in `GARBLE_CACHE`, which defaults to a directory
+such as `~/.cache/garble`. See [#708].
+
+@DominicBreuker taught `-literals` to support obfuscating large string literals
+by using the "simple" obfuscator on them, as it runs in linear time. See [#720].
+
+@mvdan added support for `garble run`, the obfuscated version of `go run`,
+to quickly test that a main program still works when obfuscated. See [#661].
+
+A number of bugfixes are also included:
+
+* Ensure that `sync/atomic` types are still aligned by the compiler - [#686]
+* Print the chosen random seed when using `-seed=random` - [#696]
+* Avoid errors in `git apply` if the system language isn't English - [#698]
+* Avoid a panic when importing a missing package - [#694]
+* Suggest a command when asking the user to rebuild garble - [#739]
+
 ## [v0.9.3] - 2023-02-12
 
 This bugfix release continues support for Go 1.19 and 1.20, and features:
@@ -199,6 +281,39 @@ Known bugs:
 
 * obfuscating the standard library with `GOPRIVATE=*` is not well supported yet
 * `garble test` is temporarily disabled, as it is currently broken
+
+[v0.12.1]: https://github.com/burrowers/garble/releases/tag/v0.12.1
+
+[v0.12.0]: https://github.com/burrowers/garble/releases/tag/v0.12.0
+[#690]: https://github.com/burrowers/garble/issues/690
+[#812]: https://github.com/burrowers/garble/issues/812
+[#816]: https://github.com/burrowers/garble/pull/816
+[#819]: https://github.com/burrowers/garble/pull/819
+[#825]: https://github.com/burrowers/garble/pull/825
+
+[v0.11.0]: https://github.com/burrowers/garble/releases/tag/v0.11.0
+[#462]: https://github.com/burrowers/garble/issues/462
+[#685]: https://github.com/burrowers/garble/issues/685
+[#763]: https://github.com/burrowers/garble/issues/763
+[#782]: https://github.com/burrowers/garble/issues/782
+[#785]: https://github.com/burrowers/garble/issues/785
+[#798]: https://github.com/burrowers/garble/issues/798
+[#801]: https://github.com/burrowers/garble/issues/801
+[#807]: https://github.com/burrowers/garble/issues/807
+
+[v0.10.1]: https://github.com/burrowers/garble/releases/tag/v0.10.1
+
+[v0.10.0]: https://github.com/burrowers/garble/releases/tag/v0.10.0
+[#641]: https://github.com/burrowers/garble/pull/641
+[#661]: https://github.com/burrowers/garble/issues/661
+[#686]: https://github.com/burrowers/garble/issues/686
+[#694]: https://github.com/burrowers/garble/issues/694
+[#696]: https://github.com/burrowers/garble/issues/696
+[#698]: https://github.com/burrowers/garble/issues/698
+[#708]: https://github.com/burrowers/garble/issues/708
+[#720]: https://github.com/burrowers/garble/pull/720
+[#732]: https://github.com/burrowers/garble/pull/732
+[#739]: https://github.com/burrowers/garble/pull/739
 
 [v0.9.3]: https://github.com/burrowers/garble/releases/tag/v0.9.3
 [#672]: https://github.com/burrowers/garble/issues/672

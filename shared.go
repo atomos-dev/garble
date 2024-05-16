@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -21,15 +22,17 @@ import (
 
 //go:generate ./scripts/gen-go-std-tables.sh
 
-// sharedCache is shared as a read-only cache between the many garble toolexec
+// sharedCacheType is shared as a read-only cache between the many garble toolexec
 // sub-processes.
 //
 // Note that we fill this cache once from the root process in saveListedPackages,
 // store it into a temporary file via gob encoding, and then reuse that file
 // in each of the garble toolexec sub-processes.
-type sharedCache struct {
+type sharedCacheType struct {
 	ExecPath          string   // absolute path to the garble binary being used
 	ForwardBuildFlags []string // build flags fed to the original "garble ..." command
+
+	CacheDir string // absolute path to the GARBLE_CACHE directory being used
 
 	// ListedPackages contains data obtained via 'go list -json -export -deps'.
 	// This allows us to obtain the non-obfuscated export data of all dependencies,
@@ -46,6 +49,13 @@ type sharedCache struct {
 
 	GOGARBLE string
 
+	// GoVersion is a version of the Go toolchain currently being used,
+	// as reported by "go env GOVERSION" and compatible with go/version.
+	// Note that the version of Go that built the garble binary might be newer.
+	// Also note that a devel version like "go1.22-231f290e51" is
+	// currently represented as "go1.22", as the suffix is ignored by go/version.
+	GoVersion string
+
 	// Filled directly from "go env".
 	// Keep in sync with fetchGoEnv.
 	GoEnv struct {
@@ -57,11 +67,11 @@ type sharedCache struct {
 	}
 }
 
-var cache *sharedCache
+var sharedCache *sharedCacheType
 
 // loadSharedCache the shared data passed from the entry garble process
 func loadSharedCache() error {
-	if cache != nil {
+	if sharedCache != nil {
 		panic("shared cache loaded twice?")
 	}
 	startTime := time.Now()
@@ -73,7 +83,7 @@ func loadSharedCache() error {
 		log.Printf("shared cache loaded in %s from %s", debugSince(startTime), f.Name())
 	}()
 	defer f.Close()
-	if err := gob.NewDecoder(f).Decode(&cache); err != nil {
+	if err := gob.NewDecoder(f).Decode(&sharedCache); err != nil {
 		return fmt.Errorf("cannot decode shared file: %v", err)
 	}
 	return nil
@@ -82,7 +92,7 @@ func loadSharedCache() error {
 // saveSharedCache creates a temporary directory to share between garble processes.
 // This directory also includes the gob-encoded cache global.
 func saveSharedCache() (string, error) {
-	if cache == nil {
+	if sharedCache == nil {
 		panic("saving a missing cache?")
 	}
 	dir, err := os.MkdirTemp("", "garble-shared")
@@ -90,8 +100,8 @@ func saveSharedCache() (string, error) {
 		return "", err
 	}
 
-	sharedCache := filepath.Join(dir, "main-cache.gob")
-	if err := writeGobExclusive(sharedCache, &cache); err != nil {
+	cachePath := filepath.Join(dir, "main-cache.gob")
+	if err := writeGobExclusive(cachePath, &sharedCache); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -100,9 +110,6 @@ func saveSharedCache() (string, error) {
 func createExclusive(name string) (*os.File, error) {
 	return os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
 }
-
-// TODO(mvdan): consider using proper atomic file writes.
-// Or possibly even "lockedfile", mimicking cmd/go.
 
 func writeFileExclusive(name string, data []byte) error {
 	f, err := createExclusive(name)
@@ -121,9 +128,8 @@ func writeGobExclusive(name string, val any) error {
 	if err != nil {
 		return err
 	}
-	if err := gob.NewEncoder(f).Encode(val); err != nil {
-		return err
-	}
+	// Always close the file, and return the first error we get.
+	err = gob.NewEncoder(f).Encode(val)
 	if err2 := f.Close(); err == nil {
 		err = err2
 	}
@@ -144,12 +150,10 @@ type listedPackage struct {
 
 	Dir             string
 	CompiledGoFiles []string
+	IgnoredGoFiles  []string
 	Imports         []string
 
-	Incomplete bool
-	// These two exist to report package loading errors to the user.
-	Error      *packageError
-	DepsErrors []*packageError
+	Error *packageError // to report package loading errors to the user
 
 	// The fields below are not part of 'go list', but are still reused
 	// between garble processes. Use "Garble" as a prefix to ensure no
@@ -159,7 +163,7 @@ type listedPackage struct {
 	// with Garble's own inputs as per addGarbleToHash.
 	// It is set even when ToObfuscate is false, as it is also used for random
 	// seeds and build cache paths, and not just to obfuscate names.
-	GarbleActionID []byte `json:"-"`
+	GarbleActionID [sha256.Size]byte `json:"-"`
 
 	// ToObfuscate records whether the package should be obfuscated.
 	// When true, GarbleActionID must not be empty.
@@ -167,6 +171,7 @@ type listedPackage struct {
 }
 
 type packageError struct {
+	Pos string
 	Err string
 }
 
@@ -177,10 +182,15 @@ func (p *listedPackage) obfuscatedImportPath() string {
 	//   * runtime: it is special in many ways
 	//   * reflect: its presence turns down dead code elimination
 	//   * embed: its presence enables using //go:embed
+	//   * others like syscall are allowed by import path to have more ABI tricks
+	//
+	// TODO: collect directly from cmd/internal/objabi/pkgspecial.go,
+	// in this particular case from allowAsmABIPkgs.
 	switch p.ImportPath {
-	case "runtime", "reflect", "embed":
+	case "runtime", "reflect", "embed", "syscall", "runtime/internal/startlinetest":
 		return p.ImportPath
 	}
+	// Intrinsics are matched by package import path as well.
 	if compilerIntrinsicsPkgs[p.ImportPath] {
 		return p.ImportPath
 	}
@@ -213,7 +223,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		args = append(args, "-deps")
 	}
 	args = append(args, garbleBuildFlags...)
-	args = append(args, cache.ForwardBuildFlags...)
+	args = append(args, sharedCache.ForwardBuildFlags...)
 
 	if !mainBuild {
 		// If the top-level build included the -mod or -modfile flags,
@@ -244,50 +254,31 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 	}
 
 	dec := json.NewDecoder(stdout)
-	if cache.ListedPackages == nil {
-		cache.ListedPackages = make(map[string]*listedPackage)
+	if sharedCache.ListedPackages == nil {
+		sharedCache.ListedPackages = make(map[string]*listedPackage)
 	}
-	var pkgErrors []string
+	var pkgErrors strings.Builder
 	for dec.More() {
 		var pkg listedPackage
 		if err := dec.Decode(&pkg); err != nil {
 			return err
 		}
 
-		// Sometimes cmd/go sets Error without setting Incomplete per the docs.
-		// TODO: remove the workaround once https://go.dev/issue/57724 is fixed.
-		if pkg.Error != nil || pkg.DepsErrors != nil {
-			pkg.Incomplete = true
-		}
-
 		if perr := pkg.Error; perr != nil {
-			switch {
-			// All errors in non-std packages are fatal,
-			// but only some errors in std packages are.
-			case strings.Contains(pkg.ImportPath, "."):
-				fallthrough
-			default:
+			if pkg.Standard && len(pkg.CompiledGoFiles) == 0 && len(pkg.IgnoredGoFiles) > 0 {
+				// Some packages in runtimeLinknamed need a build tag to be importable,
+				// like crypto/internal/boring/fipstls with boringcrypto,
+				// so any pkg.Error should be ignored when the build tag isn't set.
+			} else {
+				if pkgErrors.Len() > 0 {
+					pkgErrors.WriteString("\n")
+				}
+				if perr.Pos != "" {
+					pkgErrors.WriteString(perr.Pos)
+					pkgErrors.WriteString(": ")
+				}
 				// Error messages sometimes include a trailing newline.
-				pkgErrors = append(pkgErrors, strings.TrimSpace(perr.Err))
-
-			// Some packages in runtimeLinknamed are OS-specific,
-			// like crypto/internal/boring/fipstls, so "no Go files"
-			// for the current OS can be ignored safely as an error.
-			case pkg.Standard && strings.Contains(perr.Err, "build constraints exclude all Go files"):
-			// Some packages in runtimeLinknamed are recent,
-			// like "arena", so older Go versions that we support
-			// do not yet have them and that's OK.
-			// Note that pkg.Standard is false for them.
-			case strings.Contains(perr.Err, "is not in GOROOT"):
-			case strings.Contains(perr.Err, "cannot find package"):
-			}
-		}
-		if len(pkg.DepsErrors) > 0 {
-			// DepsErrors appears to not include the "# pkgpath" line.
-			pkgErrors = append(pkgErrors, "# "+pkg.ImportPath)
-			for _, derr := range pkg.DepsErrors {
-				// Error messages sometimes include a trailing newline.
-				pkgErrors = append(pkgErrors, strings.TrimSpace(derr.Err))
+				pkgErrors.WriteString(strings.TrimRight(perr.Err, "\n"))
 			}
 		}
 
@@ -297,26 +288,26 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		// because some like crypto/internal/boring/fipstls simply fall under
 		// "build constraints exclude all Go files" and can be ignored.
 		// Real build errors will still be surfaced by `go build -toolexec` later.
-		if cache.ListedPackages[pkg.ImportPath] != nil {
+		if sharedCache.ListedPackages[pkg.ImportPath] != nil {
 			return fmt.Errorf("duplicate package: %q", pkg.ImportPath)
 		}
 		if pkg.BuildID != "" {
-			actionID := decodeHash(splitActionID(pkg.BuildID))
+			actionID := decodeBuildIDHash(splitActionID(pkg.BuildID))
 			pkg.GarbleActionID = addGarbleToHash(actionID)
 		}
 
-		cache.ListedPackages[pkg.ImportPath] = &pkg
+		sharedCache.ListedPackages[pkg.ImportPath] = &pkg
 	}
 
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("go list error: %v:\nargs: %q\n%s", err, args, stderr.Bytes())
 	}
-	if len(pkgErrors) > 0 {
-		return errors.New(strings.Join(pkgErrors, "\n"))
+	if pkgErrors.Len() > 0 {
+		return errors.New(pkgErrors.String())
 	}
 
 	anyToObfuscate := false
-	for path, pkg := range cache.ListedPackages {
+	for path, pkg := range sharedCache.ListedPackages {
 		// If "GOGARBLE=foo/bar", "foo/bar_test" should also match.
 		if pkg.ForTest != "" {
 			path = pkg.ForTest
@@ -327,11 +318,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 			// "unknown pc" crashes on windows in the cgo test otherwise.
 			path == "runtime/cgo":
 
-		// We can't obfuscate packages which weren't loaded.
-		// This can happen since we ignore some pkg.Error messages above.
-		case pkg.Incomplete:
-
-		// No point in obfuscating empty packages.
+		// No point in obfuscating empty packages, like OS-specific ones that don't match.
 		case len(pkg.CompiledGoFiles) == 0:
 
 		// Test main packages like "foo/bar.test" are always obfuscated,
@@ -339,7 +326,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		case pkg.Name == "main" && strings.HasSuffix(path, ".test"),
 			path == "command-line-arguments",
 			strings.HasPrefix(path, "plugin/unnamed"),
-			module.MatchPrefixPatterns(cache.GOGARBLE, path):
+			module.MatchPrefixPatterns(sharedCache.GOGARBLE, path):
 
 			pkg.ToObfuscate = true
 			anyToObfuscate = true
@@ -350,8 +337,8 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 	}
 
 	// Don't error if the user ran: GOGARBLE='*' garble build runtime
-	if !anyToObfuscate && !module.MatchPrefixPatterns(cache.GOGARBLE, "runtime") {
-		return fmt.Errorf("GOGARBLE=%q does not match any packages to be built", cache.GOGARBLE)
+	if !anyToObfuscate && !module.MatchPrefixPatterns(sharedCache.GOGARBLE, "runtime") {
+		return fmt.Errorf("GOGARBLE=%q does not match any packages to be built", sharedCache.GOGARBLE)
 	}
 
 	return nil
@@ -364,41 +351,44 @@ var ErrNotFound = errors.New("not found")
 var ErrNotDependency = errors.New("not a dependency")
 
 // listPackage gets the listedPackage information for a certain package
-func listPackage(path string) (*listedPackage, error) {
-	if path == curPkg.ImportPath {
-		return curPkg, nil
+func listPackage(from *listedPackage, path string) (*listedPackage, error) {
+	if path == from.ImportPath {
+		return from, nil
 	}
 
 	// If the path is listed in the top-level ImportMap, use its mapping instead.
 	// This is a common scenario when dealing with vendored packages in GOROOT.
 	// The map is flat, so we don't need to recurse.
-	if path2 := curPkg.ImportMap[path]; path2 != "" {
+	if path2 := from.ImportMap[path]; path2 != "" {
 		path = path2
 	}
 
-	pkg, ok := cache.ListedPackages[path]
+	pkg, ok := sharedCache.ListedPackages[path]
 
-	// The runtime may list any package in std, even those it doesn't depend on.
-	// This is due to how it linkname-implements std packages,
+	// A std package may list any other package in std, even those it doesn't depend on.
+	// This is due to how runtime linkname-implements std packages,
 	// such as sync/atomic or reflect, without importing them in any way.
-	// If ListedPackages lacks such a package we fill it with "std".
-	// Note that this is also allowed for runtime sub-packages.
-	if curPkg.ImportPath == "runtime" || strings.HasPrefix(curPkg.ImportPath, "runtime/") {
+	// A few other cases don't involve runtime, like time/tzdata linknaming to time,
+	// but luckily those few cases are covered by runtimeLinknamed as well.
+	//
+	// If ListedPackages lacks such a package we fill it via runtimeLinknamed.
+	// TODO: can we instead add runtimeLinknamed to the top-level "go list" args?
+	if from.Standard {
 		if ok {
 			return pkg, nil
 		}
 		if listedRuntimeLinknamed {
-			panic(fmt.Sprintf("package %q still missing after go list call", path))
+			return nil, fmt.Errorf("package %q still missing after go list call", path)
 		}
 		startTime := time.Now()
 		missing := make([]string, 0, len(runtimeLinknamed))
 		for _, linknamed := range runtimeLinknamed {
 			switch {
-			case cache.ListedPackages[linknamed] != nil:
+			case sharedCache.ListedPackages[linknamed] != nil:
 				// We already have it; skip.
-			case cache.GoEnv.GOOS != "js" && linknamed == "syscall/js":
+			case sharedCache.GoEnv.GOOS != "js" && linknamed == "syscall/js":
 				// GOOS-specific package.
-			case cache.GoEnv.GOOS != "darwin" && linknamed == "crypto/x509/internal/macos":
+			case sharedCache.GoEnv.GOOS != "darwin" && sharedCache.GoEnv.GOOS != "ios" && linknamed == "crypto/x509/internal/macos":
 				// GOOS-specific package.
 			default:
 				missing = append(missing, linknamed)
@@ -406,11 +396,11 @@ func listPackage(path string) (*listedPackage, error) {
 		}
 		// We don't need any information about their dependencies, in this case.
 		if err := appendListedPackages(missing, false); err != nil {
-			panic(err) // should never happen
+			return nil, fmt.Errorf("failed to load missing runtime-linknamed packages: %v", err)
 		}
-		pkg, ok := cache.ListedPackages[path]
+		pkg, ok := sharedCache.ListedPackages[path]
 		if !ok {
-			panic(fmt.Sprintf("runtime listed a std package we can't find: %s", path))
+			return nil, fmt.Errorf("std listed another std package that we can't find: %s", path)
 		}
 		listedRuntimeLinknamed = true
 		log.Printf("listed %d missing runtime-linknamed packages in %s", len(missing), debugSince(startTime))
@@ -420,9 +410,9 @@ func listPackage(path string) (*listedPackage, error) {
 		return nil, fmt.Errorf("list %s: %w", path, ErrNotFound)
 	}
 
-	// Packages other than runtime can list any package,
+	// Packages outside std can list any package,
 	// as long as they depend on it directly or indirectly.
-	for _, dep := range curPkg.Deps {
+	for _, dep := range from.Deps {
 		if dep == pkg.ImportPath {
 			return pkg, nil
 		}
@@ -435,7 +425,7 @@ func listPackage(path string) (*listedPackage, error) {
 	if pkg.ImportPath == "runtime" {
 		return pkg, nil
 	}
-	for _, dep := range cache.ListedPackages["runtime"].Deps {
+	for _, dep := range sharedCache.ListedPackages["runtime"].Deps {
 		if dep == pkg.ImportPath {
 			return pkg, nil
 		}

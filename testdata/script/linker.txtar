@@ -1,14 +1,14 @@
 # Past garble versions might not properly patch cmd/link with "git apply"
 # when running inside a git repository. Skip the extra check with -short.
 [!short] [exec:git] exec git init -q
-[!short] [exec:git] env GARBLE_CACHE_DIR=${WORK}/linker-cache
+[!short] [exec:git] env GARBLE_CACHE=${WORK}/garble-cache
 
 # Any build settings for the main build shouldn't affect building the linker.
 # If this flag makes it through when using build commands on std or cmd,
 # those commands are likely to fail as std and cmd are their own modules.
 env GOFLAGS=-modfile=${WORK}/go.mod
 
-garble build
+exec garble build
 exec ./main
 ! cmp stderr main.stderr
 
@@ -19,11 +19,11 @@ exec ./main
 # building the linker twice, wasting CPU and disk.
 [!windows] env GOOS=windows
 [windows] env GOOS=linux
-garble build
-[!windows] [exec:git]   exists ${GARBLE_CACHE_DIR}/garble/link
-[!windows] [exec:git] ! exists ${GARBLE_CACHE_DIR}/garble/link.exe
-[windows]  [exec:git] ! exists ${GARBLE_CACHE_DIR}/garble/link
-[windows]  [exec:git]   exists ${GARBLE_CACHE_DIR}/garble/link.exe
+exec garble build
+[!windows] [exec:git]   exists ${GARBLE_CACHE}/tool/link
+[!windows] [exec:git] ! exists ${GARBLE_CACHE}/tool/link.exe
+[windows]  [exec:git] ! exists ${GARBLE_CACHE}/tool/link
+[windows]  [exec:git]   exists ${GARBLE_CACHE}/tool/link.exe
 env GOOS=
 
 # Verify a build without garble.
@@ -34,7 +34,7 @@ cmp stderr main.stderr
 -- go.mod --
 module test/main
 
-go 1.20
+go 1.22
 -- main.go --
 package main
 

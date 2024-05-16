@@ -27,24 +27,19 @@ const (
 	TinyEnv        = "GARBLE_LINK_TINY"
 	EntryOffKeyEnv = "GARBLE_LINK_ENTRYOFF_KEY"
 
-	cacheDirName   = "garble"
-	versionExt     = ".version"
-	garbleCacheDir = "GARBLE_CACHE_DIR"
-	baseSrcSubdir  = "src"
+	versionExt    = ".version"
+	baseSrcSubdir = "src"
 )
 
-//go:embed patches/*.patch
+//go:embed patches/*/*.patch
 var linkerPatchesFS embed.FS
 
-func loadLinkerPatches() (version string, modFiles map[string]bool, patches [][]byte, err error) {
+func loadLinkerPatches(majorGoVersion string) (version string, modFiles map[string]bool, patches [][]byte, err error) {
 	modFiles = make(map[string]bool)
 	versionHash := sha256.New()
-	err = fs.WalkDir(linkerPatchesFS, ".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
+	if err := fs.WalkDir(linkerPatchesFS, "patches/"+majorGoVersion, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return err
-		}
-		if d.IsDir() {
-			return nil
 		}
 
 		patchBytes, err := linkerPatchesFS.ReadFile(path)
@@ -68,10 +63,8 @@ func loadLinkerPatches() (version string, modFiles map[string]bool, patches [][]
 		}
 		patches = append(patches, patchBytes)
 		return nil
-	})
-
-	if err != nil {
-		return
+	}); err != nil {
+		return "", nil, nil, err
 	}
 	version = base64.RawStdEncoding.EncodeToString(versionHash.Sum(nil))
 	return
@@ -127,7 +120,7 @@ func applyPatches(srcDir, workingDir string, modFiles map[string]bool, patches [
 	cmd.Stdin = bytes.NewReader(bytes.Join(patches, []byte("\n")))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to 'git apply' patches: %v:\n%s", err, out)
 	}
 
 	// Running git without errors does not guarantee that all patches have been applied.
@@ -139,23 +132,14 @@ func applyPatches(srcDir, workingDir string, modFiles map[string]bool, patches [
 	return mod, nil
 }
 
-func cachePath() (string, error) {
-	var cacheDir string
-	if val, ok := os.LookupEnv(garbleCacheDir); ok {
-		cacheDir = val
-	} else {
-		userCacheDir, err := os.UserCacheDir()
-		if err != nil {
-			panic(fmt.Errorf("cannot retreive user cache directory: %v", err))
-		}
-		cacheDir = userCacheDir
-	}
-
-	cacheDir = filepath.Join(cacheDir, cacheDirName)
+func cachePath(cacheDir string) (string, error) {
+	// Use a subdirectory to clarify what we're using it for.
+	// Name it "tool", like Go's pkg/tool, as we might want to rebuild
+	// other Go toolchain programs like the compiler or assembler in the future.
+	cacheDir = filepath.Join(cacheDir, "tool")
 	if err := os.MkdirAll(cacheDir, 0o777); err != nil {
 		return "", err
 	}
-
 	goExe := ""
 	if runtime.GOOS == "windows" {
 		goExe = ".exe"
@@ -212,7 +196,7 @@ func buildLinker(workingDir string, overlay map[string]string, outputLinkPath st
 	//   go version -m ~/tip/pkg/tool/linux_amd64/link
 	//
 	// and which can be done from Go via debug/buildinfo.ReadFile.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(cmd.Environ(),
 		"GOENV=off", "GOOS=", "GOARCH=", "GOEXPERIMENT=", "GOFLAGS=",
 	)
 	// Building cmd/link is possible from anywhere, but to avoid any possible side effects build in a temp directory
@@ -226,13 +210,17 @@ func buildLinker(workingDir string, overlay map[string]string, outputLinkPath st
 	return nil
 }
 
-func PatchLinker(goRoot, goVersion, tempDir string) (string, func(), error) {
-	patchesVer, modFiles, patches, err := loadLinkerPatches()
+func PatchLinker(goRoot, goVersion, cacheDir, tempDir string) (string, func(), error) {
+	// rxVersion looks for a version like "go1.19" or "go1.20"
+	rxVersion := regexp.MustCompile(`go\d+\.\d+`)
+	majorGoVersion := rxVersion.FindString(goVersion)
+
+	patchesVer, modFiles, patches, err := loadLinkerPatches(majorGoVersion)
 	if err != nil {
-		panic(fmt.Errorf("cannot retrieve linker patches: %v", err))
+		return "", nil, fmt.Errorf("cannot retrieve linker patches: %v", err)
 	}
 
-	outputLinkPath, err := cachePath()
+	outputLinkPath, err := cachePath(cacheDir)
 	if err != nil {
 		return "", nil, err
 	}
