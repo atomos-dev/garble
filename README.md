@@ -41,6 +41,9 @@ By default, the tool obfuscates all the packages being built.
 You can manually specify which packages to obfuscate via `GOGARBLE`,
 a comma-separated list of glob patterns matching package path prefixes.
 This format is borrowed from `GOPRIVATE`; see `go help private`.
+Patterns prefixed with `!` exclude matching package prefixes after the include
+patterns are evaluated. For example, `GOGARBLE='example.com/*,!example.com/logs'`
+obfuscates the module except for `example.com/logs` and its subpackages.
 
 Note that commands like `garble build` will use the `go` version found in your
 `$PATH`. To use different versions of Go, you can

@@ -73,6 +73,24 @@ type sharedCacheType struct {
 
 var sharedCache *sharedCacheType
 
+// matchGarblePatterns applies the regular GOGARBLE include patterns first,
+// then lets !-prefixed patterns exclude matching package path prefixes.
+func matchGarblePatterns(patterns, target string) bool {
+	var includes []string
+	for _, pattern := range strings.Split(patterns, ",") {
+		if excluded, ok := strings.CutPrefix(pattern, "!"); ok {
+			if excluded != "" && module.MatchPrefixPatterns(excluded, target) {
+				return false
+			}
+			continue
+		}
+		if pattern != "" {
+			includes = append(includes, pattern)
+		}
+	}
+	return module.MatchPrefixPatterns(strings.Join(includes, ","), target)
+}
+
 // loadSharedCache the shared data passed from the entry garble process
 func loadSharedCache() error {
 	if sharedCache != nil {
@@ -395,7 +413,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 		case pkg.Name == "main" && strings.HasSuffix(path, ".test"),
 			path == "command-line-arguments",
 			strings.HasPrefix(path, "plugin/unnamed"),
-			module.MatchPrefixPatterns(sharedCache.GOGARBLE, path):
+			matchGarblePatterns(sharedCache.GOGARBLE, path):
 
 			pkg.ToObfuscate = true
 			anyToObfuscate = true
@@ -406,7 +424,7 @@ func appendListedPackages(packages []string, mainBuild bool) error {
 	}
 
 	// Don't error if the user ran: GOGARBLE='*' garble build runtime
-	if !anyToObfuscate && !module.MatchPrefixPatterns(sharedCache.GOGARBLE, "runtime") {
+	if !anyToObfuscate && !matchGarblePatterns(sharedCache.GOGARBLE, "runtime") {
 		return fmt.Errorf("GOGARBLE=%q does not match any packages to be built", sharedCache.GOGARBLE)
 	}
 
