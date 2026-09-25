@@ -12,46 +12,30 @@ import (
 	ah "mvdan.cc/garble/internal/asthelper"
 )
 
-// updateMagicValue updates hardcoded value of hdr.magic
-// when verifying header in symtab.go
+// updateMagicValue updates the global constant
+// `Go120PCLnTabMagic PCLnTabMagic = 0xfffffff1`
+// to use the provided magic value integer.
+// This is the latest magic value in use as of Go 1.26.
 func updateMagicValue(file *ast.File, magicValue uint32) {
 	magicUpdated := false
 
-	// Find `hdr.magic != 0xfffffff?` in symtab.go and update to random magicValue
-	updateMagic := func(node ast.Node) bool {
-		binExpr, ok := node.(*ast.BinaryExpr)
-		if !ok || binExpr.Op != token.NEQ {
-			return true
-		}
-
-		selectorExpr, ok := binExpr.X.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-
-		if ident, ok := selectorExpr.X.(*ast.Ident); !ok || ident.Name != "hdr" {
-			return true
-		}
-		if selectorExpr.Sel.Name != "magic" {
-			return true
-		}
-
-		if _, ok := binExpr.Y.(*ast.BasicLit); !ok {
-			return true
-		}
-		binExpr.Y = &ast.BasicLit{
-			Kind:  token.INT,
-			Value: strconv.FormatUint(uint64(magicValue), 10),
-		}
-		magicUpdated = true
-		return false
-	}
-
 	for _, decl := range file.Decls {
-		funcDecl, ok := decl.(*ast.FuncDecl)
-		if ok && funcDecl.Name.Name == "moduledataverify1" {
-			ast.Inspect(funcDecl, updateMagic)
-			break
+		decl, ok := decl.(*ast.GenDecl)
+		if !ok || decl.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range decl.Specs {
+			spec, ok := spec.(*ast.ValueSpec)
+			if !ok || len(spec.Names) != 1 || len(spec.Values) != 1 {
+				continue
+			}
+			if spec.Names[0].Name == "Go120PCLnTabMagic" {
+				spec.Values[0] = &ast.BasicLit{
+					Kind:  token.INT,
+					Value: strconv.FormatUint(uint64(magicValue), 10),
+				}
+				magicUpdated = true
+			}
 		}
 	}
 
@@ -139,7 +123,13 @@ func updateEntryOffset(file *ast.File, entryOffKey uint32) {
 // stripRuntime removes unnecessary code from the runtime,
 // such as panic and fatal error printing, and code that
 // prints trace/debug info of the runtime.
-func stripRuntime(basename string, file *ast.File) {
+func stripRuntime(basename string, file *ast.File) map[string]bool {
+	strippedFunctions := make(map[string]bool)
+	emptyBody := func(funcDecl *ast.FuncDecl) {
+		funcDecl.Body.List = nil
+		strippedFunctions[funcDecl.Name.Name] = true
+	}
+
 	stripPrints := func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
@@ -172,6 +162,19 @@ func stripRuntime(basename string, file *ast.File) {
 			case "printany", "printanycustomtype":
 				funcDecl.Body.List = nil
 			}
+		case "debuglog.go":
+			// printDebugLog is called directly from fatal panic and signal
+			// paths. Its implementation can also write through gwrite, so the
+			// generic print/println rewrite below is not sufficient.
+			if funcDecl.Name.Name == "printDebugLog" {
+				emptyBody(funcDecl)
+			}
+		case "hexdump.go":
+			// Go 1.26 moved hexdumpWords out of print.go. It is only used for
+			// fatal GC, signal, and traceback diagnostics in production builds.
+			if funcDecl.Name.Name == "hexdumpWords" {
+				emptyBody(funcDecl)
+			}
 		case "mgcscavenge.go":
 			// used in tracing the scavenger
 			if funcDecl.Name.Name == "printScavTrace" {
@@ -200,31 +203,21 @@ func stripRuntime(basename string, file *ast.File) {
 				funcDecl.Body.List = nil
 			}
 		case "runtime1.go":
-			usesEnv := func(node ast.Node) bool {
-				for node := range ast.Preorder(node) {
-					ident, ok := node.(*ast.Ident)
-					if ok && ident.Name == "gogetenv" {
-						return true
-					}
-				}
-				return false
-			}
-		filenames:
 			switch funcDecl.Name.Name {
-			case "parsedebugvars":
-				// keep defaults for GODEBUG cgocheck and invalidptr,
-				// remove code that reads GODEBUG via gogetenv
-				for i, stmt := range funcDecl.Body.List {
-					if usesEnv(stmt) {
-						funcDecl.Body.List = funcDecl.Body.List[:i]
-						break filenames
-					}
-				}
-				panic("did not see any gogetenv call in parsedebugvars")
 			case "setTraceback":
 				// tracebacks are completely hidden, no
 				// sense keeping this function
 				funcDecl.Body.List = nil
+			}
+		case "runtime.go":
+			// writeErrStr bypasses the print builtins and writes fixed fatal
+			// diagnostics straight to stderr (and SetCrashOutput). Tiny mode
+			// already suppresses those same diagnostics through the ordinary
+			// runtime print paths, so suppress this bypass as well. Do not
+			// empty writeErrData or gwrite: application print/println relies on
+			// those lower-level writers.
+			if funcDecl.Name.Name == "writeErrStr" {
+				emptyBody(funcDecl)
 			}
 		case "traceback.go":
 			// only used for printing tracebacks
@@ -245,13 +238,30 @@ func stripRuntime(basename string, file *ast.File) {
 
 	if basename == "print.go" {
 		file.Decls = append(file.Decls, hidePrintDecl)
-		return
+		return strippedFunctions
 	}
 
 	// replace all 'print' and 'println' statements in
 	// the runtime with an empty func, which will be
 	// optimized out by the compiler
 	ast.Inspect(file, stripPrints)
+	return strippedFunctions
+}
+
+var requiredDirectRuntimeStrips = map[string][]string{
+	"debuglog.go": {"printDebugLog"},
+	"hexdump.go":  {"hexdumpWords"},
+	"runtime.go":  {"writeErrStr"},
+}
+
+func validateDirectRuntimeStripping(strippedByFile map[string]map[string]bool) {
+	for basename, names := range requiredDirectRuntimeStrips {
+		for _, name := range names {
+			if !strippedByFile[basename][name] {
+				panic("runtime stripping rule did not match " + basename + ":" + name)
+			}
+		}
+	}
 }
 
 var hidePrintDecl = &ast.FuncDecl{

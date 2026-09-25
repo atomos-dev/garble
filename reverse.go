@@ -5,7 +5,6 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"go/ast"
 	"go/types"
@@ -41,13 +40,8 @@ One can reverse a captured panic stack trace as follows:
 		return err
 	}
 
-	// We don't actually run a main Go command with all flags,
-	// so if the user gave a non-build flag,
-	// we need this check to not silently ignore it.
-	if _, firstUnknown := filterForwardBuildFlags(flags); firstUnknown != "" {
-		// A bit of a hack to get a normal flag.Parse error.
-		// Longer term, "reverse" might have its own FlagSet.
-		return flag.NewFlagSet("", flag.ContinueOnError).Parse([]string{firstUnknown})
+	if err := rejectUnknownBuildFlags(flags); err != nil {
+		return err
 	}
 
 	// A package's names are generally hashed with the action ID of its
@@ -57,7 +51,7 @@ One can reverse a captured panic stack trace as follows:
 	// so it's unnecessary to try to avoid this cost.
 	var replaces []string
 
-	for _, lpkg := range sharedCache.ListedPackages {
+	for _, lpkg := range sharedCache.ListedPackages.all() {
 		if !lpkg.ToObfuscate {
 			continue
 		}
@@ -68,16 +62,18 @@ One can reverse a captured panic stack trace as follows:
 		// Package paths are obfuscated, too.
 		addHashedWithPackage(lpkg.ImportPath)
 
-		files, err := parseFiles(lpkg, lpkg.Dir, lpkg.CompiledGoFiles)
+		// Assembly filenames are obfuscated in a simple way.
+		// Mirroring [transformer.transformAsm]; note the lack of a test
+		// as so far this has only mattered for build errors with positions.
+		for _, name := range lpkg.SFiles {
+			newName := hashWithPackage(lpkg, name) + ".s"
+			replaces = append(replaces, newName, name)
+		}
+
+		tf, files, err := transformerForListedPackage(lpkg)
 		if err != nil {
 			return err
 		}
-		origImporter := importerForPkg(lpkg)
-		_, info, err := typecheck(lpkg.ImportPath, files, origImporter)
-		if err != nil {
-			return err
-		}
-		fieldToStruct := computeFieldToStruct(info)
 		for i, file := range files {
 			goFile := lpkg.CompiledGoFiles[i]
 			for node := range ast.Preorder(file) {
@@ -91,15 +87,16 @@ One can reverse a captured panic stack trace as follows:
 					addHashedWithPackage(node.Name.Name)
 				case *ast.Field:
 					for _, name := range node.Names {
-						obj, _ := info.ObjectOf(name).(*types.Var)
+						obj, _ := tf.info.ObjectOf(name).(*types.Var)
 						if obj == nil || !obj.IsField() {
 							continue
 						}
-						strct := fieldToStruct[obj]
+						originObj := obj.Origin()
+						strct := tf.fieldToStruct[originObj]
 						if strct == nil {
 							panic("could not find struct for field " + name.Name)
 						}
-						replaces = append(replaces, hashWithStruct(strct, obj), name.Name)
+						replaces = append(replaces, hashWithStruct(strct, originObj), name.Name)
 					}
 
 				case *ast.CallExpr:

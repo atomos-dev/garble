@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
+	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
 	ah "mvdan.cc/garble/internal/asthelper"
@@ -20,10 +21,12 @@ import (
 // moderate, this also decreases the likelihood for performance slowdowns.
 const MinSize = 8
 
-// maxSize is the upper limit of the size of string-like literals
-// which we will obfuscate with any of the available obfuscators.
-// Beyond that we apply only a subset of obfuscators which are guaranteed to run efficiently.
-const maxSize = 2 << 10 // KiB
+// MaxSize is the upper limit of the size of string-like literals we will obfuscate.
+const MaxSize = 2 << 10 // 2 KiB
+
+// MaxSizeExpensive is the upper limit for using expensive obfuscators (split, seed).
+// Above this size, only cheap obfuscators are used.
+const MaxSizeExpensive = 256
 
 const (
 	// minStringJunkBytes defines the minimum number of junk bytes to prepend or append during string obfuscation.
@@ -37,9 +40,20 @@ type NameProviderFunc func(rand *mathrand.Rand, baseName string) string
 
 // Obfuscate replaces literals with obfuscated anonymous functions.
 func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkStrings map[*types.Var]string, nameFunc NameProviderFunc) *ast.File {
-	obfRand := newObfRand(rand, file, nameFunc)
+	or := newObfRand(rand, file, nameFunc)
 	pre := func(cursor *astutil.Cursor) bool {
 		switch node := cursor.Node().(type) {
+		case *ast.FuncDecl:
+			// Obfuscating literals can push the stack frame over the //go:nosplit limit,
+			// which is just 800 bytes. These funcs are mostly in the runtime,
+			// so obfuscating strings in these is less important in any case.
+			if node.Doc != nil {
+				for _, comment := range node.Doc.List {
+					if strings.HasPrefix(comment.Text, "//go:nosplit") {
+						return false
+					}
+				}
+			}
 		case *ast.GenDecl:
 			// constants are obfuscated by replacing all references with the obfuscated value
 			if node.Tok == token.CONST {
@@ -71,11 +85,11 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 
 		if typeAndValue.Type == types.Typ[types.String] && typeAndValue.Value != nil {
 			value := constant.StringVal(typeAndValue.Value)
-			if len(value) < MinSize {
+			if len(value) < MinSize || len(value) > MaxSize {
 				return true
 			}
 
-			cursor.Replace(withPos(obfuscateString(obfRand, value), node.Pos()))
+			cursor.Replace(withPos(obfuscateString(or, value), node.Pos()))
 
 			return true
 		}
@@ -92,7 +106,7 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 			}
 
 			if child, ok := node.X.(*ast.CompositeLit); ok {
-				newnode := handleCompositeLiteral(obfRand, true, child, info)
+				newnode := handleCompositeLiteral(or, true, child, info)
 				if newnode != nil {
 					cursor.Replace(newnode)
 				}
@@ -111,7 +125,7 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 				return true
 			}
 
-			newnode := handleCompositeLiteral(obfRand, false, node, info)
+			newnode := handleCompositeLiteral(or, false, node, info)
 			if newnode != nil {
 				cursor.Replace(newnode)
 			}
@@ -121,7 +135,7 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 	}
 
 	newFile := astutil.Apply(file, pre, post).(*ast.File)
-	obfRand.proxyDispatcher.AddToFile(newFile)
+	or.proxyDispatcher.AddToFile(newFile)
 	return newFile
 }
 
@@ -130,8 +144,8 @@ func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkString
 // be used to replace it.
 //
 // If the input node cannot be obfuscated nil is returned.
-func handleCompositeLiteral(obfRand *obfRand, isPointer bool, node *ast.CompositeLit, info *types.Info) ast.Node {
-	if len(node.Elts) < MinSize {
+func handleCompositeLiteral(or *obfRand, isPointer bool, node *ast.CompositeLit, info *types.Info) ast.Node {
+	if len(node.Elts) < MinSize || len(node.Elts) > MaxSize {
 		return nil
 	}
 
@@ -173,10 +187,10 @@ func handleCompositeLiteral(obfRand *obfRand, isPointer bool, node *ast.Composit
 	}
 
 	if arrayLen > 0 {
-		return withPos(obfuscateByteArray(obfRand, isPointer, data, arrayLen), node.Pos())
+		return withPos(obfuscateByteArray(or, isPointer, data, arrayLen), node.Pos())
 	}
 
-	return withPos(obfuscateByteSlice(obfRand, isPointer, data), node.Pos())
+	return withPos(obfuscateByteSlice(or, isPointer, data), node.Pos())
 }
 
 // withPos sets any token.Pos fields under node which affect printing to pos.
@@ -223,22 +237,22 @@ func withPos(node ast.Node, pos token.Pos) ast.Node {
 	return node
 }
 
-func obfuscateString(obfRand *obfRand, data string) *ast.CallExpr {
-	obf := getNextObfuscator(obfRand, len(data))
+func obfuscateString(or *obfRand, data string) *ast.CallExpr {
+	obf := or.pickObfuscator(len(data))
 
 	// Generate junk bytes to to prepend and append to the data.
 	// This is to prevent the obfuscated string from being easily fingerprintable.
-	junkBytes := make([]byte, obfRand.Intn(maxStringJunkBytes-minStringJunkBytes)+minStringJunkBytes)
-	obfRand.Read(junkBytes)
-	splitIdx := obfRand.Intn(len(junkBytes))
+	junkBytes := make([]byte, or.rnd.Intn(maxStringJunkBytes-minStringJunkBytes)+minStringJunkBytes)
+	or.rnd.Read(junkBytes)
+	splitIdx := or.rnd.Intn(len(junkBytes))
 
-	extKeys := randExtKeys(obfRand.Rand)
+	extKeys := randExtKeys(or.rnd)
 
 	plainData := []byte(data)
 	plainDataWithJunkBytes := append(append(junkBytes[:splitIdx], plainData...), junkBytes[splitIdx:]...)
 
-	block := obf.obfuscate(obfRand.Rand, plainDataWithJunkBytes, extKeys)
-	params, args := extKeysToParams(obfRand, extKeys)
+	block := obf.obfuscate(or.rnd, plainDataWithJunkBytes, extKeys)
+	params, args := extKeysToParams(or, extKeys)
 
 	// Generate unique cast bytes to string function and hide it using proxyDispatcher:
 	//
@@ -275,16 +289,16 @@ func obfuscateString(obfRand *obfRand, data string) *ast.CallExpr {
 			),
 		),
 	}
-	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(obfRand.proxyDispatcher.HideValue(funcVal, funcTyp), ast.NewIdent("data"))))
+	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(or.proxyDispatcher.HideValue(funcVal, funcTyp), ast.NewIdent("data"))))
 	return ah.LambdaCall(params, ast.NewIdent("string"), block, args)
 }
 
-func obfuscateByteSlice(obfRand *obfRand, isPointer bool, data []byte) *ast.CallExpr {
-	obf := getNextObfuscator(obfRand, len(data))
+func obfuscateByteSlice(or *obfRand, isPointer bool, data []byte) *ast.CallExpr {
+	obf := or.pickObfuscator(len(data))
 
-	extKeys := randExtKeys(obfRand.Rand)
-	block := obf.obfuscate(obfRand.Rand, data, extKeys)
-	params, args := extKeysToParams(obfRand, extKeys)
+	extKeys := randExtKeys(or.rnd)
+	block := obf.obfuscate(or.rnd, data, extKeys)
+	params, args := extKeysToParams(or, extKeys)
 
 	if isPointer {
 		block.List = append(block.List, ah.ReturnStmt(
@@ -297,12 +311,12 @@ func obfuscateByteSlice(obfRand *obfRand, isPointer bool, data []byte) *ast.Call
 	return ah.LambdaCall(params, ah.ByteSliceType(), block, args)
 }
 
-func obfuscateByteArray(obfRand *obfRand, isPointer bool, data []byte, length int64) *ast.CallExpr {
-	obf := getNextObfuscator(obfRand, len(data))
+func obfuscateByteArray(or *obfRand, isPointer bool, data []byte, length int64) *ast.CallExpr {
+	obf := or.pickObfuscator(len(data))
 
-	extKeys := randExtKeys(obfRand.Rand)
-	block := obf.obfuscate(obfRand.Rand, data, extKeys)
-	params, args := extKeysToParams(obfRand, extKeys)
+	extKeys := randExtKeys(or.rnd)
+	block := obf.obfuscate(or.rnd, data, extKeys)
+	params, args := extKeysToParams(or, extKeys)
 
 	arrayType := ah.ByteArrayType(length)
 
@@ -344,10 +358,15 @@ func obfuscateByteArray(obfRand *obfRand, isPointer bool, data []byte, length in
 	return ah.LambdaCall(params, arrayType, block, args)
 }
 
-func getNextObfuscator(obfRand *obfRand, size int) obfuscator {
-	if size <= maxSize {
-		return obfRand.nextObfuscator()
-	} else {
-		return obfRand.nextLinearTimeObfuscator()
+func (or *obfRand) pickObfuscator(size int) obfuscator {
+	if size < MinSize || size > MaxSize {
+		panic(fmt.Sprintf("nextObfuscator called with size %d outside [%d, %d]", size, MinSize, MaxSize))
 	}
+	if or.testObfuscator != nil {
+		return or.testObfuscator
+	}
+	if size <= MaxSizeExpensive {
+		return Obfuscators[or.rnd.Intn(len(Obfuscators))]
+	}
+	return CheapObfuscators[or.rnd.Intn(len(CheapObfuscators))]
 }

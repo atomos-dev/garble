@@ -143,16 +143,10 @@ func appendFlags(w io.Writer, forBuildHash bool) {
 	if flagDebugDir != "" && !forBuildHash {
 		// -debugdir is a bit special.
 		//
-		// When passing down flags via -toolexec,
-		// we do want the actual flag value to be kept.
+		// When passing down flags via -toolexec, keep the actual flag value.
 		//
-		// For build hashes, we can skip the flag entirely,
-		// as it doesn't affect obfuscation at all.
-		//
-		// TODO: in the future, we could avoid using the -a build flag
-		// by using "-debugdir=yes" here, and caching the obfuscated source.
-		// Incremental builds would recover the cached source
-		// to repopulate the output directory if it was removed.
+		// For build hashes, skip the flag entirely, as it doesn't affect
+		// obfuscation output.
 		io.WriteString(w, " -debugdir=")
 		io.WriteString(w, flagDebugDir)
 	}
@@ -204,7 +198,8 @@ func toUpper(b byte) byte { return b - ('a' - 'A') }
 func runtimeHashWithCustomSalt(salt []byte) uint32 {
 	hasher.Reset()
 	if !flagSeed.present() {
-		hasher.Write(sharedCache.ListedPackages["runtime"].GarbleActionID[:])
+		runtimePkg, _ := sharedCache.ListedPackages.get("runtime")
+		hasher.Write(runtimePkg.GarbleActionID[:])
 	} else {
 		hasher.Write(flagSeed.bytes)
 	}

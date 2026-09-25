@@ -60,20 +60,20 @@ type obfuscator interface {
 }
 
 var (
-	simpleObfuscator = simple{}
-
-	// Obfuscators contains all types which implement the obfuscator Interface
+	// Obfuscators contains all types which implement the obfuscator Interface.
 	Obfuscators = []obfuscator{
-		simpleObfuscator,
+		simple{},
 		swap{},
 		split{},
 		shuffle{},
 		seed{},
 	}
 
-	// LinearTimeObfuscators contains all types which implement the obfuscator Interface and can safely be used on large literals
-	LinearTimeObfuscators = []obfuscator{
-		simpleObfuscator,
+	// CheapObfuscators contains obfuscators safe to use on large literals.
+	// The expensive obfuscators scale poorly, so they are excluded here.
+	CheapObfuscators = []obfuscator{
+		simple{},
+		swap{},
 	}
 
 	TestObfuscator         string
@@ -110,7 +110,7 @@ func operatorToReversedBinaryExpr(t token.Token, x, y ast.Expr) *ast.BinaryExpr 
 	var op token.Token
 	switch t {
 	case token.XOR:
-		op = token.XOR
+		op = token.XOR // XOR is self-inverse: (a ^ b) ^ b = a
 	case token.ADD:
 		op = token.SUB
 	case token.SUB:
@@ -178,7 +178,7 @@ func extKeysToParams(objRand *obfRand, keys []*externalKey) (params *ast.FieldLi
 		params.List = append(params.List, ah.Field(key.Type(), name))
 
 		var extKeyExpr ast.Expr = ah.UintLit(key.value)
-		if lowProb.Try(objRand.Rand) {
+		if lowProb.Try(objRand.rnd) {
 			extKeyExpr = objRand.proxyDispatcher.HideValue(extKeyExpr, ast.NewIdent(key.typ))
 		}
 		args = append(args, extKeyExpr)
@@ -234,7 +234,7 @@ func dataToByteSliceWithExtKeys(rand *mathrand.Rand, data []byte, extKeys []*ext
 	return ah.LambdaCall(nil, ah.ByteSliceType(), ah.BlockStmt(stmts...), nil)
 }
 
-// dataToByteSliceWithExtKeys scramble and turns a byte into an AST expression like:
+// byteLitWithExtKey scrambles a byte value into an AST expression like:
 //
 //	byte(<obfuscated value>) <random operator> byte(<external key> >> <random shift>)
 func byteLitWithExtKey(rand *mathrand.Rand, val byte, extKeys []*externalKey, extKeyProb externalKeyProbability) ast.Expr {
@@ -255,24 +255,10 @@ func byteLitWithExtKey(rand *mathrand.Rand, val byte, extKeys []*externalKey, ex
 }
 
 type obfRand struct {
-	*mathrand.Rand
-	testObfuscator obfuscator
+	rnd *mathrand.Rand
 
+	testObfuscator  obfuscator
 	proxyDispatcher *proxyDispatcher
-}
-
-func (r *obfRand) nextObfuscator() obfuscator {
-	if r.testObfuscator != nil {
-		return r.testObfuscator
-	}
-	return Obfuscators[r.Intn(len(Obfuscators))]
-}
-
-func (r *obfRand) nextLinearTimeObfuscator() obfuscator {
-	if r.testObfuscator != nil {
-		return r.testObfuscator
-	}
-	return Obfuscators[r.Intn(len(LinearTimeObfuscators))]
 }
 
 func newObfRand(rand *mathrand.Rand, file *ast.File, nameFunc NameProviderFunc) *obfRand {

@@ -24,20 +24,20 @@ name: Test
 jobs:
   test:
     strategy:
+      # We mainly develop on Linux, so being able to see MacOS and Windows failures
+      # is useful even if we already know at least one job will fail.
+      fail-fast: false
       matrix:
-        go-version: [1.25.x]
+        go-version: [1.26.x]
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go-version }}
         cache: false
-    # linux already runs the tests with -race below, plus extra checks,
-    # so skip the regular tests to prevent it from taking the longest.
-    - if: matrix.os != 'ubuntu-latest'
-      run: go test -timeout=15m ./...
+    - run: go test -timeout=15m ./...
     # macos and windows failures with bincmp can be hard to reproduce locally,
     # so upload the binaries as artifacts.
     - uses: actions/upload-artifact@v4
@@ -45,25 +45,16 @@ jobs:
       with:
         name: bincmp_output
         path: bincmp_output/
-    # macos and windows tend to be a bit slower,
-    # and it's rare that a race in garble would be OS-specific.
-    - if: matrix.os == 'ubuntu-latest'
-      run: go test -race -timeout=20m ./...
 
     # Static checks from this point forward. Only run on one Go version and on
     # linux, since it's the fastest platform, and the tools behave the same.
-    - name: Test third-party project builds
-      if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25.x'
-      run: |
-        go install
-        ./scripts/check-third-party.sh
-    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25.x'
+    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26.x'
       run: ./scripts/crlf-test.sh
-    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25.x'
+    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26.x'
       run: diff <(echo -n) <(gofmt -d .)
-    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25.x'
+    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26.x'
       run: go vet ./...
-    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25.x'
+    - if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.26.x'
       uses: dominikh/staticcheck-action@v1
       with:
         version: "2025.1"
@@ -78,9 +69,35 @@ jobs:
     env:
       GOARCH: 386
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - uses: actions/setup-go@v5
       with:
-        go-version: 1.25.x
+        go-version: 1.26.x
         cache: false
     - run: go test -short ./...
+
+  # Only run the short tests with -race, because otherwise the overhead is too much.
+  # We only test on Linux, as races are unlikely to be OS-specific.
+  # We use GOAMD64=v3 because that significantly speeds up the race detector.
+  test-race:
+    runs-on: ubuntu-latest
+    env:
+      GOAMD64: v3
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/setup-go@v5
+      with:
+        go-version: 1.26.x
+        cache: false
+    - run: go test -short -race ./...
+
+  test-third-party:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/setup-go@v5
+      with:
+        go-version: 1.26.x
+        cache: false
+    - run: go install
+    - run: ./scripts/check-third-party.sh

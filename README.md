@@ -1,17 +1,16 @@
 # garble
 
-	go install mvdan.cc/garble@latest
+	go install mvdan.cc/garble@latest # or @master
 
-Obfuscate Go code by wrapping the Go toolchain. Requires Go 1.25 or later.
+Obfuscate Go code by wrapping the Go toolchain. Requires Go 1.26 or later.
 
 	garble build [build flags] [packages]
 
 The tool also supports `garble test` to run tests with obfuscated code,
 `garble run` to obfuscate and execute simple programs,
-and `garble reverse` to de-obfuscate text such as stack traces.
+`garble reverse` to de-obfuscate text such as stack traces,
+and `garble bug` to file a pre-filled bug report.
 Run `garble -h` to see all available commands and flags.
-
-You can also use `go install mvdan.cc/garble@master` to install the latest development version.
 
 ### Purpose
 
@@ -29,11 +28,9 @@ The tool is designed to be:
 The tool wraps calls to the Go compiler and linker to transform the Go build, in
 order to:
 
-* Replace as many useful identifiers as possible with short base64 hashes
-* Replace package paths with short base64 hashes
-* Replace filenames and position information with short base64 hashes
-* Remove all [build](https://go.dev/pkg/runtime/#Version) and [module](https://go.dev/pkg/runtime/debug/#ReadBuildInfo) information
-* Strip debugging information and symbol tables via `-ldflags="-w -s"`
+* Replace identifiers and package paths with short base64 hashes
+* Replace position information with short base64 hashed filenames
+* Remove all [build](https://go.dev/pkg/runtime/#Version), [module](https://go.dev/pkg/runtime/debug/#ReadBuildInfo), and debug information
 * [Obfuscate literals](#literal-obfuscation), if the `-literals` flag is given
 * Remove [extra information](#tiny-mode), if the `-tiny` flag is given
 
@@ -46,15 +43,7 @@ patterns are evaluated. For example, `GOGARBLE='example.com/*,!example.com/logs'
 obfuscates the module except for `example.com/logs` and its subpackages.
 
 Note that commands like `garble build` will use the `go` version found in your
-`$PATH`. To use different versions of Go, you can
-[install them](https://go.dev/doc/manage-install#installing-multiple)
-and set up `$PATH` with them. For example, for Go 1.17.1:
-
-```sh
-$ go install golang.org/dl/go1.17.1@latest
-$ go1.17.1 download
-$ PATH=$(go1.17.1 env GOROOT)/bin:${PATH} garble build
-```
+`$PATH`. To use different versions of Go, you can [use `GOTOOLCHAIN`](https://go.dev/doc/toolchain).
 
 ### Use cases
 
@@ -90,6 +79,9 @@ Literals used in constant expressions cannot be obfuscated, since they are
 resolved at compile time. This includes any expressions part of a `const`
 declaration, for example.
 
+Note that this process can be reversed given enough effort;
+see [#984](https://github.com/burrowers/garble/issues/984).
+
 ### Tiny mode
 
 With the `-tiny` flag, even more information is stripped from the Go binary.
@@ -99,8 +91,7 @@ Many symbol names are also omitted from binary sections at link time.
 All in all, this can make binaries about 15% smaller.
 
 With this flag, no panics or fatal runtime errors will ever be printed, but they
-can still be handled internally with `recover` as normal. In addition, the
-`GODEBUG` environmental variable will be ignored.
+can still be handled internally with `recover` as normal.
 
 Note that this flag can make debugging crashes harder, as a panic will simply
 exit the entire program without printing a stack trace, and source code
@@ -176,7 +167,8 @@ to document the current shortcomings of this tool.
 
 * APIs like [`runtime.GOROOT`](https://pkg.go.dev/runtime#GOROOT)
   and [`runtime/debug.ReadBuildInfo`](https://pkg.go.dev/runtime/debug#ReadBuildInfo)
-  will not work in obfuscated binaries. This [can affect loading timezones](https://github.com/golang/go/issues/51473#issuecomment-2490564684), for example.
+  will not work in obfuscated binaries. This can affect
+  [loading timezones](https://github.com/golang/go/issues/51473#issuecomment-2490564684), for example.
 
 ### Contributing
 

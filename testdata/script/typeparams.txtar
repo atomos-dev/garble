@@ -7,6 +7,8 @@ go 1.23
 -- garble_main.go --
 package main
 
+import "test/main/lib"
+
 func main() {
 	GenericFunc[int, int](1, 2)
 	var _ GenericVector[int]
@@ -16,6 +18,22 @@ func main() {
 
 	g2 := GenericGraph[*[]byte]{Content: new([]byte)}
 	g2.Edges = make([]GenericGraph[*[]byte], 1)
+
+	var ga genericAlias
+	ga.list = nil
+	var gan genericAliasNamed
+	gan.list = nil
+
+	e := lib.Entry[string, int]{Key: "foo", Data: 123}
+	r := lib.Load[string, int](e)
+	_ = r.Data
+
+	_ = lib.SelectWhere.Users.Name
+	_ = lib.SelectIdentity.Value
+
+	// A plain struct is convertible to a generic instantiation whose origin
+	// underlying uses a type parameter; both fields must obfuscate alike.
+	_ = lib.Box[int](struct{ Contents int }{})
 }
 
 func GenericFunc[GenericParamA, B any](x GenericParamA, y B) {}
@@ -53,3 +71,77 @@ func sliceOfPointer() Slice[*any] {
 type Map[K, V comparable] map[K]V
 
 var _ = Map[string, struct{}]{}
+
+type Result[T any] interface {
+	AsResult() Result[T]
+	Redirect(struct { ret T })
+}
+
+type AsyncResult[oldT, newT any] struct {}
+
+func (w *AsyncResult[oldT, newT]) AsResult() Result[newT] {
+	return w
+}
+
+func (w *AsyncResult[oldT, newT]) Redirect(struct {ret newT}) {}
+
+type genericAlias = generic[int]
+type generic[T any] struct {
+	list *T
+}
+
+type genericAliasNamed genericAlias
+
+func byKeys[T any](m map[string]T) []struct {
+	K string
+	V T
+} {
+	vs := make([]struct {
+		K string
+		V T
+	}, 0, len(m))
+	for k, v := range m {
+		vs = append(vs, struct {
+			K string
+			V T
+		}{k, v})
+	}
+	return vs
+}
+
+var _ = byKeys(map[string]int{"one": 1})
+-- lib/lib.go --
+package lib
+
+type Result[Data any] struct {
+	Data Data
+}
+
+type Entry[Key ~string, Data any] struct {
+	Key  Key
+	Data Data
+}
+
+func Load[Key ~string, Data any](e Entry[Key, Data]) Result[Data] {
+	return Result[Data]{Data: e.Data}
+}
+
+type Filter[Q any] struct{ Name Q }
+
+func Where[Q any]() struct {
+	Users Filter[Q]
+} {
+	return struct{ Users Filter[Q] }{}
+}
+
+var SelectWhere = Where[int]()
+
+func Identity[Q any]() struct {
+	Value Q
+} {
+	return struct{ Value Q }{}
+}
+
+var SelectIdentity = Identity[int]()
+
+type Box[T any] struct{ Contents T }
