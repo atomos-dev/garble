@@ -206,6 +206,10 @@ func buildLinker(goRoot, workingDir string, overlay map[string]string, outputLin
 	// and which can be done from Go via debug/buildinfo.ReadFile.
 	cmd.Env = append(cmd.Environ(),
 		"GOENV=off", "GOOS=", "GOARCH=", "GOEXPERIMENT=", "GOFLAGS=",
+		// Downloaded toolchains live under GOMODCACHE, where Go forbids
+		// overlays. cmd/link only needs SDK sources, so isolate its module
+		// cache and keep it on the supplied toolchain.
+		"GOMODCACHE="+filepath.Join(workingDir, "modcache"), "GOTOOLCHAIN=local",
 	)
 	// Building cmd/link is possible from anywhere, but to avoid any possible side effects build in a temp directory
 	cmd.Dir = workingDir
